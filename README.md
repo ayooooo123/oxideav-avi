@@ -9,6 +9,13 @@ into stable oxideav codec ids. Zero C dependencies.
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
 
+## PearTube fork compatibility
+
+Audio streams preserve WAVEFORMATEX `nBlockAlign` in
+`CodecParameters.options["block_align"]`, allowing registered WMA v1/v2
+decoders to initialize from AVI headers. The existing strict restriction
+requiring zero `dwSampleSize` for those codecs is unchanged.
+
 ## Installation
 
 ```toml

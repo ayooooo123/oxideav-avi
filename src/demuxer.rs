@@ -4839,6 +4839,7 @@ fn build_stream(
                 p.channels = Some(w.channels);
                 p.sample_rate = Some(w.samples_per_sec);
                 p.extradata = w.extradata.clone();
+                p.options.insert("block_align", w.block_align.to_string());
                 // For extensible streams, prefer the SubFormat's
                 // wValidBitsPerSample for the sample-format hint —
                 // matches what the underlying codec actually decodes
