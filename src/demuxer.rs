@@ -135,19 +135,20 @@ const OPENDML_SUPER_INDEX_SOFT_CAP: usize = 256;
 /// Factory registered with the container registry. Returns a boxed
 /// trait object — callers that need AVI-specific accessors like
 /// [`AviDemuxer::field2_offset_for_packet`] should use [`open_avi`]
-/// instead.
+/// instead. It opens what FFmpeg's avidec plays: a `strh.dwSampleSize`
+/// that disagrees with the audio codec only changes how the stream is
+/// timed (see [`open_avi_lenient`]), as it does in avidec.
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    Ok(Box::new(open_avi(input, codecs)?))
+    Ok(Box::new(open_avi_lenient(input, codecs)?))
 }
 
 /// Open an AVI demuxer and return the concrete [`AviDemuxer`] so
 /// callers can access AVI-specific accessors like
 /// [`AviDemuxer::field2_offset_for_packet`] (round-5 candidate 1).
 ///
-/// Same parsing behaviour as the trait-object [`open`]; the only
-/// difference is the return type so callers can hold the concrete
-/// handle alongside the [`oxideav_core::Demuxer`] trait it
-/// implements.
+/// Parses as the trait-object [`open`] does, returning the concrete type
+/// so callers can hold it alongside the [`oxideav_core::Demuxer`] trait
+/// it implements, and validates where [`open`] plays:
 ///
 /// Round-14 candidate 2: also runs the per-audio-stream
 /// `(strh.dwSampleSize, wave_format.format_tag)` invariant check
@@ -1573,6 +1574,17 @@ fn open_avi_inner(
     // empty seek table while the chunk WAS present). Drives the
     // `avih.dwFlags` `AVIF_HASINDEX` cross-check.
     let has_idx1 = idx1_raw.is_some();
+    // avidec.c's timestamp rules per stream, and its MPEG audio parser on
+    // MPEG audio stored by the byte.
+    let mut ticks = stream_ticks(&streams, &stream_sample_sizes, &audio_infos);
+    let mpa: Vec<Option<MpaSplitter>> = ticks
+        .iter()
+        .zip(&audio_infos)
+        .map(|(t, a)| {
+            let mpeg = a.as_ref().is_some_and(|a| matches!(a.format_tag, WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3));
+            (mpeg && matches!(t, Tick::Bytes(_))).then(MpaSplitter::default)
+        })
+        .collect();
     let idx_table = if let Some(raw) = idx1_raw {
         scan_idx1_sideband_counts(
             &raw,
@@ -1626,7 +1638,7 @@ fn open_avi_inner(
                 }
             }
         }
-        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &streams)?;
+        let (table, recs) = build_idx_table(&mut *input, &raw, movi_start, &ticks)?;
         idx1_rec_entries = recs;
         table
     } else {
@@ -2416,6 +2428,7 @@ fn open_avi_inner(
                 params,
             };
             streams.push(audio);
+            ticks.push(Tick::Packet);
             DvType1 { video: video as u32, audio: streams.len() as u32 - 1 }
         });
 
@@ -2429,6 +2442,9 @@ fn open_avi_inner(
         dv_type1,
         dv_audio_pending: None,
         dv_audio_timed: false,
+        ticks,
+        mpa,
+        mpa_ready: None,
         movi_start,
         movi_segments,
         current_segment: 0,
@@ -5372,7 +5388,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     r: &mut R,
     raw: &[u8],
     movi_start: u64,
-    streams: &[StreamInfo],
+    ticks: &[Tick],
 ) -> Result<(Vec<IdxEntry>, Vec<Idx1RecEntry>)> {
     if raw.len() < 16 {
         return Ok((Vec::new(), Vec::new()));
@@ -5469,7 +5485,7 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
                 continue;
             }
         };
-        if (stream as usize) >= streams.len() {
+        if (stream as usize) >= ticks.len() {
             continue;
         }
         let abs = base_off.saturating_add(raw_off as u64);
@@ -5483,15 +5499,13 @@ fn build_idx_table<R: ReadSeek + ?Sized>(
     }
 
     // Second pass: assign per-stream pts by walking each stream's entries
-    // in idx1 order, mirroring the pts-bump logic in `next_packet`.
-    // The per-stream block-align divisor is hoisted out of the loop
-    // (round-415 perf — `packet_time_delta` re-derived it per entry).
-    let divisors = time_delta_divisors(streams);
-    let mut per_stream_pts: Vec<i64> = vec![0; streams.len()];
+    // in idx1 order, mirroring the pts-bump logic in `next_packet` (the
+    // stream's `Tick`).
+    let mut per_stream_pts: Vec<i64> = vec![0; ticks.len()];
     for e in entries.iter_mut() {
         let s = e.stream as usize;
         e.pts = per_stream_pts[s];
-        let bump = time_delta_with_divisor(divisors[s], e.size as usize) as i64;
+        let bump = ticks[s].advance(e.size as usize) as i64;
         per_stream_pts[s] = per_stream_pts[s].saturating_add(bump);
     }
 
@@ -5628,6 +5642,13 @@ pub struct AviDemuxer {
     /// ones carry no pts (the frames hold varying sample counts; the
     /// decoder's output continues the timeline).
     dv_audio_timed: bool,
+    /// How each stream's packets advance its timestamp.
+    ticks: Vec<Tick>,
+    /// The MPEG audio frame splitter of each byte-counted MPEG audio
+    /// stream (FFmpeg's parser on such streams).
+    mpa: Vec<Option<MpaSplitter>>,
+    /// The stream whose splitter may hold whole frames.
+    mpa_ready: Option<usize>,
     /// Absolute start-of-first-movi offset. Retained so `seek_to` can bound
     /// against the beginning of packet data and build_idx_table has an
     /// offset base.
@@ -7750,6 +7771,11 @@ impl Demuxer for AviDemuxer {
             self.per_stream_counter = vec![0u64; self.streams.len()];
         }
         loop {
+            // The whole MPEG audio frames of the last chunk of a
+            // byte-counted stream come out before the next chunk is read.
+            if let Some(pkt) = self.next_mpa_frame() {
+                return Ok(pkt);
+            }
             let current_end = self
                 .movi_segments
                 .get(self.current_segment)
@@ -7895,13 +7921,20 @@ impl Demuxer for AviDemuxer {
                         if !corrupt {
                             skip_pad(&mut *self.input, hdr.size)?;
                         }
-                        let stream = &self.streams[idx as usize];
                         let counter = self.per_stream_counter[idx as usize];
-                        // PTS: for video the counter is a frame index in the
-                        // stream's time_base. For audio we advance by the
-                        // number of samples in this packet (PCM: block_align
-                        // derived from bps*channels; other codecs we just use
-                        // the packet counter in units of rate/scale).
+                        let tick = self.ticks[idx as usize];
+                        if let Some(split) = self.mpa.get_mut(idx as usize).and_then(Option::as_mut) {
+                            // FFmpeg's MPEG audio parser: the chunk's bytes
+                            // (from its byte position) join the stream; whole
+                            // frames come out from the loop's top.
+                            split.push(counter.saturating_mul(u64::from(tick.bytes())), &data);
+                            self.per_stream_counter[idx as usize] = counter + tick.advance(data.len());
+                            self.mpa_ready = Some(idx as usize);
+                            continue;
+                        }
+                        let stream = &self.streams[idx as usize];
+                        // avidec.c: the timestamp counts packets, started
+                        // blocks or bytes over the sample size (`Tick`).
                         let pts = counter as i64;
                         let mut pkt = Packet::new(idx, stream.time_base, data);
                         pkt.pts = Some(pts);
@@ -7923,8 +7956,7 @@ impl Demuxer for AviDemuxer {
                             .copied()
                             .unwrap_or(true);
                         // Bump counter.
-                        let bump = packet_time_delta(stream, pkt.data.len());
-                        self.per_stream_counter[idx as usize] = counter + bump;
+                        self.per_stream_counter[idx as usize] = counter + tick.advance(pkt.data.len());
                         if let Some(dv) = self.dv_type1.filter(|dv| dv.video == idx) {
                             let mut audio = Packet::new(dv.audio, pkt.time_base, pkt.data.clone());
                             let pts = if self.dv_audio_timed { None } else { pkt.pts };
@@ -7957,6 +7989,7 @@ impl Demuxer for AviDemuxer {
         };
         self.dv_audio_pending = None;
         self.dv_audio_timed = false;
+        self.reset_mpa();
         if (stream_index as usize) >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "AVI: stream index {stream_index} out of range"
@@ -11416,6 +11449,7 @@ impl AviDemuxer {
                 "AVI: stream index {stream_index} out of range"
             )));
         }
+        self.reset_mpa();
         if self.idx_table.is_empty() {
             return Err(Error::unsupported(
                 "AVI: seek_to_first_video_keyframe_after requires idx1 \
@@ -11539,6 +11573,7 @@ impl AviDemuxer {
                 "AVI: stream index {stream_index} out of range"
             )));
         }
+        self.reset_mpa();
         if self.std_indexes.is_empty() {
             return Err(Error::unsupported(
                 "AVI: seek_to_keyframe_strict_via_std_index requires OpenDML ix## standard indexes",
@@ -11647,11 +11682,7 @@ impl AviDemuxer {
     /// per demuxer.
     fn ensure_seek_cache(&mut self) {
         if self.seek_cache.is_none() {
-            self.seek_cache = Some(build_seek_cache(
-                &self.idx_table,
-                &self.std_indexes,
-                &self.streams,
-            ));
+            self.seek_cache = Some(build_seek_cache(&self.idx_table, &self.std_indexes, &self.ticks));
         }
     }
 }
@@ -11663,9 +11694,9 @@ impl AviDemuxer {
 fn build_seek_cache(
     idx_table: &[IdxEntry],
     std_indexes: &[StdIndex],
-    streams: &[StreamInfo],
+    ticks: &[Tick],
 ) -> SeekCache {
-    let n = streams.len();
+    let n = ticks.len();
     let mut idx1_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
     let mut idx1_kf_monotonic = vec![true; n];
     let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
@@ -11702,7 +11733,6 @@ fn build_seek_cache(
     // counter reset historically used.
     let mut running_signed = vec![0i64; n];
     let mut running_unsigned = vec![0u64; n];
-    let divisors = time_delta_divisors(streams);
     for ix in std_indexes {
         let stream = match parse_stream_index(&ix.chunk_id) {
             Some(s) => s,
@@ -11732,7 +11762,7 @@ fn build_seek_cache(
                 }
                 std_keyframes[s].push((running_signed[s], header_off));
             }
-            let bump = time_delta_with_divisor(divisors[s], e.dw_size as usize);
+            let bump = ticks[s].advance(e.dw_size as usize);
             running_signed[s] = running_signed[s].saturating_add(bump as i64);
             running_unsigned[s] = running_unsigned[s].saturating_add(bump);
         }
@@ -11804,46 +11834,190 @@ fn ascii_hex(b: u8) -> Option<u8> {
     }
 }
 
-fn packet_time_delta(stream: &StreamInfo, payload_len: usize) -> u64 {
-    time_delta_with_divisor(time_delta_divisor(stream), payload_len)
+/// How a stream's packets advance its timestamp, as FFmpeg's avidec
+/// (`get_duration`, with `avi_read_header`'s sample-size rules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tick {
+    /// One per packet: video, and audio with no sample or block size.
+    Packet,
+    /// One per `n` bytes: the stream's sample size (audio stored by the
+    /// byte, PCM by the sample frame).
+    Bytes(u32),
+    /// One per started `n`-byte block: audio with no sample size, by its
+    /// nBlockAlign.
+    Blocks(u32),
 }
 
-/// The per-stream state behind [`packet_time_delta`], factored out so
-/// batch walks (idx1 pts assignment, seek-cache build) can derive it
-/// once per stream instead of once per entry (round-415 perf).
-/// `Some(block_align)` ⇒ the stream ticks `payload / block_align` per
-/// packet (CBR audio); `None` ⇒ one tick per packet (video, data,
-/// audio with no usable block align).
-fn time_delta_divisor(stream: &StreamInfo) -> Option<usize> {
-    match stream.params.media_type {
-        MediaType::Audio => {
-            // PCM: duration = frames = payload / block_align. Non-PCM: one
-            // tick per packet is a reasonable fallback.
-            stream
-                .params
-                .channels
-                .zip(stream.params.sample_format)
-                .map(|(c, f)| (c as usize) * f.bytes_per_sample())
-                .filter(|&v| v > 0)
+impl Tick {
+    /// The ticks a packet of `len` bytes advances the timestamp.
+    pub(crate) fn advance(self, len: usize) -> u64 {
+        match self {
+            Tick::Packet => 1,
+            Tick::Bytes(n) => (len / n as usize) as u64,
+            Tick::Blocks(n) => len.div_ceil(n as usize) as u64,
         }
-        _ => None,
+    }
+
+    /// The bytes one tick stands for (1 unless the stream counts bytes).
+    fn bytes(self) -> u32 {
+        match self {
+            Tick::Bytes(n) => n,
+            _ => 1,
+        }
     }
 }
 
-/// Per-stream divisors for a whole stream table (see
-/// [`time_delta_divisor`]).
-fn time_delta_divisors(streams: &[StreamInfo]) -> Vec<Option<usize>> {
-    streams.iter().map(time_delta_divisor).collect()
+/// Each stream's [`Tick`], from its `strh.dwSampleSize` and, for audio,
+/// WAVEFORMATEX: avidec.c sets an audio stream's sample size to its
+/// nBlockAlign when both are set and differ, drops it for MP3 frames of
+/// 1152 and AAC frames of 1024 or 4096 declared as both, and ignores an
+/// nBlockAlign of 4 or less for AAC, MP2 and FLAC.
+fn stream_ticks(streams: &[StreamInfo], sample_sizes: &[Option<u32>], audio: &[Option<AudioStrhInfo>]) -> Vec<Tick> {
+    streams
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if s.params.media_type != MediaType::Audio {
+                return Tick::Packet;
+            }
+            let mut size = sample_sizes.get(i).copied().flatten().unwrap_or(0);
+            let (tag, mut align) = match audio.get(i).and_then(Option::as_ref) {
+                Some(a) => (a.format_tag, u32::from(a.block_align)),
+                None => (0, 0),
+            };
+            if size != 0 && align != 0 && size != align {
+                size = align;
+            }
+            let aac = matches!(tag, WAVE_FORMAT_AAC | WAVE_FORMAT_AAC_ADTS);
+            if (aac || tag == WAVE_FORMAT_MPEG || tag == 0xF1AC) && align <= 4 {
+                align = 0;
+            }
+            if (aac && (align, size) == (1024, 1024)) || (aac && (align, size) == (4096, 4096)) || (tag == WAVE_FORMAT_MPEGLAYER3 && (align, size) == (1152, 1152)) {
+                size = 0;
+            }
+            if size > 0 {
+                Tick::Bytes(size)
+            } else if align > 0 {
+                Tick::Blocks(align)
+            } else {
+                Tick::Packet
+            }
+        })
+        .collect()
 }
 
-/// Apply a precomputed [`time_delta_divisor`] to one packet's payload
-/// length. Matches [`packet_time_delta`] exactly, including the
-/// integer division yielding 0 ticks for a sub-block-align payload.
-#[inline]
-fn time_delta_with_divisor(divisor: Option<usize>, payload_len: usize) -> u64 {
-    match divisor {
-        Some(block_align) => (payload_len / block_align) as u64,
-        None => 1,
+/// The length of the MPEG audio frame (ISO/IEC 11172-3 and 13818-3) whose
+/// four header bytes are `h`, or None when they are no frame header (or a
+/// free-format one).
+fn mpa_frame_len(h: [u8; 4]) -> Option<usize> {
+    const BITRATE: [[[u16; 15]; 3]; 2] = [
+        [
+            [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+            [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+        ],
+        [
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        ],
+    ];
+    let w = u32::from_be_bytes(h);
+    let version = (w >> 19) & 3; // 0 MPEG-2.5, 2 MPEG-2, 3 MPEG-1
+    let layer = (w >> 17) & 3; // 3 I, 2 II, 1 III
+    let bitrate = ((w >> 12) & 15) as usize;
+    let rate = ((w >> 10) & 3) as usize;
+    if w & 0xFFE0_0000 != 0xFFE0_0000 || version == 1 || layer == 0 || bitrate == 0 || bitrate == 15 || rate == 3 {
+        return None;
+    }
+    let lsf = usize::from(version != 3);
+    let sample_rate = [44_100u32, 48_000, 32_000][rate] >> (3 - version.max(1)).min(2);
+    let layer = (3 - layer) as usize;
+    let bits = u32::from(BITRATE[lsf][layer][bitrate]) * 1000;
+    let pad = (w >> 9) & 1;
+    let len = match layer {
+        0 => (12 * bits / sample_rate + pad) * 4,
+        1 => 144 * bits / sample_rate + pad,
+        _ => (if lsf == 1 { 72 } else { 144 }) * bits / sample_rate + pad,
+    };
+    Some(len as usize)
+}
+
+/// FFmpeg's MPEG audio parser over a stream stored by the byte: chunk
+/// bytes in, whole frames out, each with the stream byte it starts at.
+#[derive(Debug, Default)]
+struct MpaSplitter {
+    /// Stream bytes not handed out yet.
+    buf: Vec<u8>,
+    /// The stream byte `buf[0]` is.
+    at: u64,
+    /// A frame has come out since open or the last seek.
+    timed: bool,
+}
+
+impl MpaSplitter {
+    /// Appends a chunk that starts at stream byte `at`.
+    fn push(&mut self, at: u64, data: &[u8]) {
+        if self.buf.is_empty() {
+            self.at = at;
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// The next whole frame and its stream byte, junk before it skipped;
+    /// None until the buffer holds one.
+    fn frame(&mut self) -> Option<(Vec<u8>, u64)> {
+        let start = self.buf.windows(4).position(|h| mpa_frame_len([h[0], h[1], h[2], h[3]]).is_some_and(|n| n >= 4));
+        let Some(start) = start else {
+            // Keep a header the next chunk may complete.
+            let keep = self.buf.len().min(3);
+            self.at += (self.buf.len() - keep) as u64;
+            self.buf.drain(..self.buf.len() - keep);
+            return None;
+        };
+        self.buf.drain(..start);
+        self.at += start as u64;
+        let len = mpa_frame_len([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])?;
+        if self.buf.len() < len {
+            return None;
+        }
+        let at = self.at;
+        self.at += len as u64;
+        Some((self.buf.drain(..len).collect(), at))
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl AviDemuxer {
+    /// The next whole frame of the byte-counted MPEG audio stream whose
+    /// chunk was read last; the first after open or a seek is timed by
+    /// the byte it starts at, later ones by the decoder's output.
+    fn next_mpa_frame(&mut self) -> Option<Packet> {
+        let idx = self.mpa_ready?;
+        let tick = self.ticks[idx];
+        let split = self.mpa.get_mut(idx)?.as_mut()?;
+        let Some((data, at)) = split.frame() else {
+            self.mpa_ready = None;
+            return None;
+        };
+        let pts = (!split.timed).then(|| (at / u64::from(tick.bytes())) as i64);
+        split.timed = true;
+        let mut pkt = Packet::new(idx as u32, self.streams[idx].time_base, data);
+        pkt.pts = pts;
+        pkt.dts = pts;
+        pkt.flags.keyframe = true;
+        Some(pkt)
+    }
+
+    /// Drops the MPEG audio frames in progress (after a seek).
+    fn reset_mpa(&mut self) {
+        self.mpa_ready = None;
+        for split in self.mpa.iter_mut().flatten() {
+            split.reset();
+        }
     }
 }
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The registry's demuxer opens files whose audio `strh.dwSampleSize`
+  disagrees with the codec, as FFmpeg's avidec does (Intel H.263 captures
+  with MP3 stored by the byte were refused: "VBR codec requires
+  strh.dwSampleSize == 0"); `open_avi` still validates.
+- Timestamps advance as avidec's `get_duration`: by bytes over the sample
+  size (set to nBlockAlign when they differ; dropped for 1152-sample MP3
+  and 1024/4096 AAC frames declared as both), by started nBlockAlign
+  blocks when there is no sample size, else one per packet. Byte-counted
+  compressed audio was one tick per chunk, and A-law/µ-law were counted
+  by their decoded sample width.
+- MPEG audio stored by the byte is split into whole frames, as FFmpeg's
+  parser splits it, across chunk boundaries; the first frame after open
+  or a seek is timed by the byte it starts at, later ones by the decoder.
+
 ### Added
 
 - Type-1 DV (an `iavs`/`ivas` stream with a `dvsd`/`dvhd`/`dvsl`
