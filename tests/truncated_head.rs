@@ -16,7 +16,9 @@
 //! reproduce the round-15 failure modes — and assert the demuxer:
 //!
 //! 1. Opens cleanly (no `read_exact` UnexpectedEof bubble),
-//! 2. Surfaces every frame wholly inside the truncated bytes,
+//! 2. Surfaces every frame wholly inside the truncated bytes, and, as
+//!    FFmpeg's demuxer does, the part of a frame cut by the end of the
+//!    file, flagged corrupt,
 //! 3. Stops with `Error::Eof` at the truncation boundary
 //!    (no panic, no infinite loop).
 //!
@@ -27,8 +29,8 @@
 use std::io::Cursor;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Packet, ReadSeek, SampleFormat, StreamInfo, TimeBase,
-    WriteSeek,
+    CodecId, CodecParameters, CodecTag, Error, Packet, ReadSeek, SampleFormat, StreamInfo,
+    TimeBase, WriteSeek,
 };
 
 /// Tempfile-based builder: muxes a small valid PCM AVI to disk, reads
@@ -110,6 +112,47 @@ fn drain_packets(buf: Vec<u8>) -> Vec<Vec<u8>> {
     got
 }
 
+/// [`drain_packets`] keeping each packet's corrupt flag.
+fn drain(buf: Vec<u8>) -> Vec<(Vec<u8>, bool)> {
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    let mut dmx = oxideav_avi::demuxer::open(rs, &oxideav_core::NullCodecResolver)
+        .expect("AVI demuxer open should accept truncated head");
+    let mut got = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => got.push((p.data, p.flags.corrupt)),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("expected Eof at truncation, got {e:?}"),
+        }
+    }
+    got
+}
+
+/// A one-stream video AVI of `frames` (FourCC VP50), as the muxer writes it.
+fn build_video_avi(tag: &str, frames: &[Vec<u8>]) -> Vec<u8> {
+    let mut params = CodecParameters::video(CodecId::new("vp5"));
+    params.width = Some(64);
+    params.height = Some(48);
+    params.tag = Some(CodecTag::fourcc(b"VP50"));
+    let stream = StreamInfo { index: 0, time_base: TimeBase::new(1, 25), duration: None, start_time: Some(0), params };
+    let tmp = std::env::temp_dir().join(format!("oxideav-avi-trunc-{tag}-{}.avi", std::process::id()));
+    {
+        let ws: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&tmp).unwrap());
+        let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
+        mux.write_header().unwrap();
+        for (i, f) in frames.iter().enumerate() {
+            let mut pkt = Packet::new(0, stream.time_base, f.clone());
+            pkt.pts = Some(i as i64);
+            pkt.flags.keyframe = i == 0;
+            mux.write_packet(&pkt).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    bytes
+}
+
 // ----------------------------------------------------------------------
 // Truncated-head fixtures (synthesised, not borrowed from any third
 // party — these are deltas applied to the muxer's own output).
@@ -166,35 +209,32 @@ fn riff_oversize_declared_walks_clean() {
 /// Fixture (c): **Physical truncation** — chop the last 200 bytes off
 /// a valid 4-packet AVI. The idx1 trailer falls inside the truncated
 /// region, so the demuxer falls back to linear movi walking. The last
-/// packet's body straddles the truncation boundary.
+/// packet's body straddles the truncation boundary: as FFmpeg's demuxer
+/// does (`av_get_packet` on the short read), its present bytes come out
+/// as a final packet flagged corrupt.
 #[test]
-fn physical_truncation_drops_partial_tail_packet() {
+fn physical_truncation_keeps_the_partial_tail_packet() {
     let mut buf = build_pcm_avi("phys-trunc-tail", 4, 256);
     let original_len = buf.len();
-    // Truncate the last 200 bytes so we lose at least the idx1 chunk and
-    // potentially the tail of the last movi packet.
-    buf.truncate(original_len.saturating_sub(200));
+    let idx1 = find_fourcc(&buf, b"idx1").expect("muxer emits idx1");
+    let lost_from_body = 200 - (original_len - idx1);
+    buf.truncate(original_len - 200);
 
-    let got = drain_packets(buf);
-    // We should recover 3 or 4 packets (depending on where the cut lands).
-    // Importantly: no error, no panic.
-    assert!(
-        got.len() >= 3 && got.len() <= 4,
-        "expected 3-4 packets, got {}",
-        got.len()
-    );
-    for (i, p) in got.iter().enumerate() {
-        assert_eq!(p.len(), 256 * 4, "packet {i} should be a full block");
+    let got = drain(buf);
+    assert_eq!(got.len(), 4, "the cut packet comes out too");
+    for (i, (data, corrupt)) in got.iter().take(3).enumerate() {
+        assert_eq!(data.len(), 256 * 4, "packet {i} is a full block");
+        assert!(!corrupt, "packet {i} is whole");
     }
+    assert_eq!(got[3].0.len(), 256 * 4 - lost_from_body, "the bytes the file still has");
+    assert!(got[3].1, "the cut packet is flagged corrupt");
 }
 
 /// Fixture (d): Truncate the file partway through the **last packet's
-/// body** specifically — the chunk header parses cleanly but the
-/// `read_exact` inside `next_packet` would otherwise hit
-/// UnexpectedEof. The demuxer should drop the partial frame and
-/// surface `Eof`.
+/// body** specifically: the chunk header parses cleanly and the body is
+/// short. FFmpeg returns the half that is present, flagged corrupt.
 #[test]
-fn physical_truncation_inside_packet_body_drops_partial() {
+fn physical_truncation_inside_packet_body_keeps_the_present_half() {
     let buf = build_pcm_avi("phys-trunc-body", 4, 256);
     // Walk forward inside the movi LIST body chunk-by-chunk so we find
     // the **last actual packet header** (not an idx1 entry that
@@ -229,15 +269,34 @@ fn physical_truncation_inside_packet_body_drops_partial() {
     let mut truncated = buf;
     truncated.truncate(cut_at);
 
-    let got = drain_packets(truncated);
-    // Headers + bodies of packets 0..2 are wholly inside the truncated
-    // buffer — packet 3's body is short. Demuxer should surface 3
-    // packets cleanly, then Eof on the 4th body's UnexpectedEof.
-    assert_eq!(
-        got.len(),
-        3,
-        "expected 3 full packets recovered (4th body truncated)"
-    );
+    let got = drain(truncated);
+    assert_eq!(got.len(), 4, "3 whole packets and the cut one");
+    assert!(got[..3].iter().all(|(d, c)| d.len() == size && !c));
+    assert_eq!(got[3].0.len(), size / 2);
+    assert!(got[3].1, "flagged corrupt");
+}
+
+/// A video stream cut inside its last frame (the shape of FATE's
+/// vp5/potter512-400-partial.avi, whose last 2308-byte chunk has 1262
+/// bytes in the file): every frame comes out, the last with the bytes
+/// present, as FFmpeg's 247 packets do.
+#[test]
+fn video_cut_inside_its_last_frame_keeps_the_frame() {
+    let frames: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 300 + 7 * i as usize]).collect();
+    let buf = build_video_avi("video-cut", &frames);
+    // The last frame's chunk header: the last `00dc` before idx1.
+    let idx1 = find_fourcc(&buf, b"idx1").expect("muxer emits idx1");
+    let last = buf[..idx1].windows(4).rposition(|w| w == b"00dc").expect("a video chunk");
+    let mut cut = buf;
+    cut.truncate(last + 8 + 100);
+    let got = drain(cut);
+    assert_eq!(got.len(), 5, "every frame");
+    for (i, (data, corrupt)) in got.iter().take(4).enumerate() {
+        assert_eq!(data, &frames[i], "frame {i}");
+        assert!(!corrupt);
+    }
+    assert_eq!(got[4].0, frames[4][..100], "the present part of the last frame");
+    assert!(got[4].1, "flagged corrupt");
 }
 
 /// Fixture (e): **AVI 1.0 with no `idx1`** — degrade to linear walk.

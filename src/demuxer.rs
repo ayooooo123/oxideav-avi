@@ -44,11 +44,11 @@
 //!    end-of-file as a clean stop (no more chunks) rather than
 //!    propagating an "AVI: truncated chunk header" error — there is
 //!    nothing more to parse, the file just ended early.
-//! 3. `next_packet` returns `Error::Eof` when a `read_exact` mid-body
-//!    short-reads (`UnexpectedEof`) instead of bubbling the I/O
-//!    error up. Any frames wholly inside the file are still
-//!    surfaced; the partial frame at the truncation boundary is
-//!    dropped silently.
+//! 3. `next_packet` returns the chunk the end of the file cuts short
+//!    with the bytes present, flagged corrupt, as FFmpeg's
+//!    `av_get_packet` returns a short read (`AV_PKT_FLAG_CORRUPT`); the
+//!    next call returns `Error::Eof`. Frames wholly inside the file are
+//!    surfaced as before.
 //!
 //! Genuinely malformed inputs — wrong RIFF FourCC, recursive `LIST`
 //! sizes inconsistent **before** the truncation point, missing
@@ -2404,6 +2404,7 @@ fn open_avi_inner(
         movi_start,
         movi_segments,
         current_segment: 0,
+        file_len,
         per_stream_counter: Vec::new(),
         metadata,
         duration_micros,
@@ -5097,15 +5098,23 @@ fn read_body_bounded<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<
     let mut bounded = <&mut R as std::io::Read>::take(&mut *r, size as u64);
     let got = std::io::Read::read_to_end(&mut bounded, &mut buf)?;
     if got < total {
-        // Truncated body — same `UnexpectedEof` kind `read_exact`
-        // surfaced so `is_unexpected_eof` callers translate it into a
-        // clean `Error::Eof` exactly as before.
+        // Truncated body: the `UnexpectedEof` kind `read_exact` gives
+        // (the side-band chunk readers skip such a chunk).
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "AVI: truncated chunk body",
         )
         .into());
     }
+    Ok(buf)
+}
+
+/// The up to `size` bytes of a chunk body the input still has (fewer at
+/// the end of the file), with [`read_body_bounded`]'s allocation bound.
+fn read_body_partial<R: std::io::Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity((size as usize).min(64 * 1024) + 64);
+    let mut bounded = <&mut R as std::io::Read>::take(&mut *r, size as u64);
+    std::io::Read::read_to_end(&mut bounded, &mut buf)?;
     Ok(buf)
 }
 
@@ -5120,11 +5129,6 @@ fn probe_file_len<R: ReadSeek + ?Sized>(r: &mut R) -> Result<u64> {
     Ok(end)
 }
 
-/// True if `e` is an `Error::Io` wrapping a `std::io::ErrorKind::UnexpectedEof`.
-/// Used to translate truncated-tail body reads into a clean `Error::Eof`.
-fn is_unexpected_eof(e: &Error) -> bool {
-    matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
-}
 
 /// Parse a raw `idx1` body, decide whether the recorded offsets are
 /// file-absolute or `movi`-relative (both are seen in the wild), and
@@ -5576,6 +5580,10 @@ pub struct AviDemuxer {
     /// Index into `movi_segments` of the segment `next_packet` is
     /// currently walking.
     current_segment: usize,
+    /// Bytes physically in the input. A chunk the end of the file cuts
+    /// short comes out with the bytes present, flagged corrupt, as
+    /// FFmpeg's `av_get_packet` returns a short read.
+    file_len: u64,
     /// Running packet counter per stream — used to synthesise PTS.
     per_stream_counter: Vec<u64>,
     metadata: Vec<(String, String)>,
@@ -7715,10 +7723,13 @@ impl Demuxer for AviDemuxer {
                                                                // Continue: next iteration will consume its nested chunks.
                 continue;
             }
-            // End of movi guard in case sizes disagree.
+            // End of movi guard in case sizes disagree. A chunk cut by
+            // the end of the file (the segment runs to it) is read as far
+            // as the file goes, as FFmpeg reads it; one past a segment
+            // that ends earlier stops the walk.
             let body_end = self.input.stream_position()? + hdr.size as u64;
-            if body_end > current_end {
-                // Truncated or bad size — stop.
+            let cut_by_eof = body_end > self.file_len && current_end >= self.file_len;
+            if body_end > current_end && !cut_by_eof {
                 return Err(Error::Eof);
             }
             if hdr.id == *b"JUNK" || hdr.id == *b"junk" {
@@ -7811,15 +7822,17 @@ impl Demuxer for AviDemuxer {
                         || suffix == *b"db"
                         || suffix == *b"wb";
                     if accept {
-                        let data = match read_body_bounded(&mut *self.input, hdr.size) {
-                            Ok(d) => d,
-                            Err(e) if is_unexpected_eof(&e) => {
-                                // Truncated tail: drop the partial frame.
-                                return Err(Error::Eof);
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        skip_pad(&mut *self.input, hdr.size)?;
+                        // av_get_packet: a body the file cuts short comes
+                        // out as far as it goes, flagged corrupt (nothing
+                        // at all ends the walk).
+                        let data = read_body_partial(&mut *self.input, hdr.size)?;
+                        let corrupt = data.len() < hdr.size as usize;
+                        if data.is_empty() && corrupt {
+                            return Err(Error::Eof);
+                        }
+                        if !corrupt {
+                            skip_pad(&mut *self.input, hdr.size)?;
+                        }
                         let stream = &self.streams[idx as usize];
                         let counter = self.per_stream_counter[idx as usize];
                         // PTS: for video the counter is a frame index in the
@@ -7831,6 +7844,7 @@ impl Demuxer for AviDemuxer {
                         let mut pkt = Packet::new(idx, stream.time_base, data);
                         pkt.pts = Some(pts);
                         pkt.dts = Some(pts);
+                        pkt.flags.corrupt = corrupt;
                         // Stamp the TRUE keyframe flag from the per-chunk
                         // index (idx1 `AVIIF_KEYFRAME` or OpenDML `ix##`
                         // delta bit), keyed on this chunk's header offset.
