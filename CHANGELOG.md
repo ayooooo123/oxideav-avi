@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An empty payload chunk (a dropped frame) yields no packet and only
+  advances its stream's clock, as avidec.c skips it (type-1 DV files
+  excepted, as there): FATE `mjpeg/mjpeg_field_order.avi` gives FFmpeg's 3
+  packets (pts 0, 6, 8) instead of 9, 6 of them empty.
 - The registry's demuxer opens files whose audio `strh.dwSampleSize`
   disagrees with the codec, as FFmpeg's avidec does (Intel H.263 captures
   with MP3 stored by the byte were refused: "VBR codec requires

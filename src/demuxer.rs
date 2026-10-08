@@ -7909,6 +7909,15 @@ impl Demuxer for AviDemuxer {
                         || suffix == *b"dc"
                         || suffix == *b"db"
                         || suffix == *b"wb";
+                    if accept && hdr.size == 0 && self.dv_type1.is_none() {
+                        // avidec.c:1371-1380: an empty chunk (a dropped
+                        // frame) yields no packet; the stream's clock still
+                        // advances by its duration (`get_duration`). Type-1
+                        // DV files keep theirs, as FFmpeg's dv_demux path does.
+                        let tick = self.ticks[idx as usize];
+                        self.per_stream_counter[idx as usize] += tick.advance(0);
+                        continue;
+                    }
                     if accept {
                         // av_get_packet: a body the file cuts short comes
                         // out as far as it goes, flagged corrupt (nothing
