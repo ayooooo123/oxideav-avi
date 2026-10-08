@@ -2394,6 +2394,31 @@ fn open_avi_inner(
         })
         .collect();
 
+    // Type-1 DV (FFmpeg avidec's `iavs`/`ivas`): the one stream of whole
+    // DIF frames is the video, and its audio comes out too, as a stream of
+    // the same frames for the DV audio decoder. Appended after every
+    // per-`strl` table is built, so no chunk addresses it.
+    let dv_type1 = streams
+        .iter()
+        .position(|s| {
+            s.params.media_type == MediaType::Video
+                && matches!(stream_fcc_types.get(s.index as usize), Some(Some(t)) if t == b"iavs" || t == b"ivas")
+        })
+        .map(|video| {
+            let v = &streams[video];
+            let mut params = CodecParameters::audio(CodecId::new("dvaudio"));
+            params.tag = v.params.tag.clone();
+            let audio = StreamInfo {
+                index: streams.len() as u32,
+                time_base: v.time_base,
+                duration: v.duration,
+                start_time: v.start_time,
+                params,
+            };
+            streams.push(audio);
+            DvType1 { video: video as u32, audio: streams.len() as u32 - 1 }
+        });
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
@@ -2401,6 +2426,9 @@ fn open_avi_inner(
         input,
         streams,
         packet_chunk_suffix,
+        dv_type1,
+        dv_audio_pending: None,
+        dv_audio_timed: false,
         movi_start,
         movi_segments,
         current_segment: 0,
@@ -4916,6 +4944,17 @@ fn build_stream(
             p.extradata = strf.to_vec();
             (MediaType::Subtitle, codec_id, p, *b"tx")
         }
+        b"iavs" | b"ivas" if DV_HANDLERS.contains(&fcc_handler) => {
+            // Type-1 DV: whole DIF frames; the video here, the audio as
+            // the demuxer's extra `dvaudio` stream (see `DvType1`).
+            let tag = CodecTag::fourcc(&fcc_handler);
+            let codec_id = codecs
+                .resolve_tag(&ProbeContext::new(&tag))
+                .unwrap_or_else(|| video_codec_id_fallback(&fcc_handler));
+            let mut p = CodecParameters::video(codec_id.clone());
+            p.tag = Some(tag);
+            (MediaType::Video, codec_id, p, *b"__")
+        }
         _ => {
             // "mids", "dats", vendor types — represent as data.
             let codec_id = CodecId::new(format!(
@@ -5559,6 +5598,18 @@ pub struct VideoStrfInfo {
     pub planes: u16,
 }
 
+/// The `strh.fccHandler` values FFmpeg's avidec accepts on a type-1 DV
+/// (`iavs`/`ivas`) stream.
+const DV_HANDLERS: [[u8; 4]; 3] = [*b"dvsd", *b"dvhd", *b"dvsl"];
+
+/// A type-1 DV file's streams: the `strl`'s video and the audio the
+/// demuxer adds (the same DIF frames).
+#[derive(Clone, Copy, Debug)]
+struct DvType1 {
+    video: u32,
+    audio: u32,
+}
+
 /// Concrete AVI demuxer. Returned by [`open_avi`] for callers that
 /// need direct access to AVI-specific accessors like
 /// [`AviDemuxer::field2_offset_for_packet`] (round-5 candidate 1).
@@ -5569,6 +5620,14 @@ pub struct AviDemuxer {
     streams: Vec<StreamInfo>,
     /// For each stream, the expected 2-byte chunk-name suffix in `movi`.
     packet_chunk_suffix: Vec<[u8; 2]>,
+    /// The streams of a type-1 DV file, when it is one.
+    dv_type1: Option<DvType1>,
+    /// The audio copy of the DV frame just returned on the video stream.
+    dv_audio_pending: Option<Packet>,
+    /// A DV audio packet has come out since open or the last seek: later
+    /// ones carry no pts (the frames hold varying sample counts; the
+    /// decoder's output continues the timeline).
+    dv_audio_timed: bool,
     /// Absolute start-of-first-movi offset. Retained so `seek_to` can bound
     /// against the beginning of packet data and build_idx_table has an
     /// offset base.
@@ -7684,6 +7743,9 @@ impl Demuxer for AviDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
+        if let Some(audio) = self.dv_audio_pending.take() {
+            return Ok(audio);
+        }
         if self.per_stream_counter.len() != self.streams.len() {
             self.per_stream_counter = vec![0u64; self.streams.len()];
         }
@@ -7739,7 +7801,7 @@ impl Demuxer for AviDemuxer {
             // Payload chunk format: "NNsf" where NN is two ASCII digits and
             // sf ∈ {"dc","db","wb","pc","tx"}.
             if let Some(idx) = parse_stream_index(&hdr.id) {
-                if (idx as usize) < self.streams.len() {
+                if (idx as usize) < self.packet_chunk_suffix.len() {
                     let expected = self.packet_chunk_suffix[idx as usize];
                     let suffix = [hdr.id[2], hdr.id[3]];
                     // Round-8 candidate 3: explicitly recognise `xxpc`
@@ -7863,6 +7925,16 @@ impl Demuxer for AviDemuxer {
                         // Bump counter.
                         let bump = packet_time_delta(stream, pkt.data.len());
                         self.per_stream_counter[idx as usize] = counter + bump;
+                        if let Some(dv) = self.dv_type1.filter(|dv| dv.video == idx) {
+                            let mut audio = Packet::new(dv.audio, pkt.time_base, pkt.data.clone());
+                            let pts = if self.dv_audio_timed { None } else { pkt.pts };
+                            self.dv_audio_timed = true;
+                            audio.pts = pts;
+                            audio.dts = pts;
+                            audio.flags.keyframe = true;
+                            audio.flags.corrupt = pkt.flags.corrupt;
+                            self.dv_audio_pending = Some(audio);
+                        }
                         return Ok(pkt);
                     } else {
                         skip_chunk(&mut *self.input, &hdr)?;
@@ -7878,6 +7950,13 @@ impl Demuxer for AviDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        // Type-1 DV audio seeks with the frames it is carried in.
+        let stream_index = match self.dv_type1 {
+            Some(dv) if dv.audio == stream_index => dv.video,
+            _ => stream_index,
+        };
+        self.dv_audio_pending = None;
+        self.dv_audio_timed = false;
         if (stream_index as usize) >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "AVI: stream index {stream_index} out of range"
@@ -8751,7 +8830,8 @@ impl AviDemuxer {
         if self.avih_streams == 0 {
             return None;
         }
-        let actual = self.streams.len() as u32;
+        // The parsed strls (a type-1 DV file's extra audio stream has none).
+        let actual = self.packet_chunk_suffix.len() as u32;
         if self.avih_streams != actual {
             Some((self.avih_streams, actual))
         } else {

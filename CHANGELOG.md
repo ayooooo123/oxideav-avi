@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Type-1 DV (an `iavs`/`ivas` stream with a `dvsd`/`dvhd`/`dvsl`
+  handler, as FFmpeg's avidec reads it): the stream is the DV video, and
+  the demuxer adds a `dvaudio` stream of the same DIF frames (tagged with
+  the DV FourCC) for the DV audio decoder. Its first packet after open or
+  a seek carries the frame's pts; later ones carry none, since frames
+  hold varying sample counts. Such files gave no packets at all (their
+  `00__` chunks matched no stream).
+
 ### Fixed
 
 - A chunk the end of the file cuts short comes out with the bytes present,
