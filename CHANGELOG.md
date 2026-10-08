@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A chunk the end of the file cuts short comes out with the bytes present,
+  flagged corrupt, as FFmpeg's `av_get_packet` returns a short read (it
+  was dropped, one frame short of FFmpeg on cut-off files such as FATE's
+  vp5/potter512-400-partial.avi).
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-avi/compare/v0.0.9...v0.0.10) - 2026-08-13
 
 ### Other
