@@ -134,6 +134,61 @@ fn a_seek_times_the_next_frame_by_its_byte() {
     assert_eq!((data, pts), (frames[6].clone(), Some(627)));
 }
 
+#[test]
+fn seek_skips_payload_sync_patterns_before_timing_a_frame() {
+    // The indexed chunk begins inside frame 5. Its compressed payload can
+    // look like a valid MPEG header, including the stream's own layer.
+    for header in [
+        [0xff, 0xff, 0x90, 0x00], // Layer I
+        [0xff, 0xfd, 0x90, 0x00], // Layer II
+        [0xff, 0xf3, 0x40, 0xc0], // same Layer III format as the real frames
+    ] {
+        let mut frames = frames();
+        frames[5][70..74].copy_from_slice(&header);
+        let stream = frames.concat();
+        // Split the false header and the following real header across
+        // different chunk boundaries.
+        let mut d = open(avi(&stream, &[250, 333, 11, 34, 103, 0], 1));
+        assert_eq!(d.seek_to(0, 590).unwrap(), 583);
+        let got = drain(&mut *d);
+        assert_eq!(got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), frames[6..]);
+        assert_eq!(got[0].1, Some(627));
+        assert!(got[1..].iter().all(|(_, pts)| pts.is_none()));
+        // A later seek must discard the previous framing lock too.
+        assert_eq!(d.seek_to(0, 590).unwrap(), 583);
+        assert_eq!(drain(&mut *d), got);
+    }
+}
+
+#[test]
+fn resynchronization_keeps_variable_bitrate_and_final_frames() {
+    let mut frames = frames();
+    // MPEG-2 Layer III, 48 kbit/s instead of 32: 156 bytes.
+    frames[6] = vec![0xff, 0xf3, 0x60, 0xc0];
+    frames[6].resize(156, 6);
+    frames[5][70..74].copy_from_slice(&[0xff, 0xf3, 0x40, 0xc0]);
+    let mut d = open(avi(&frames.concat(), &[250, 333, 11, 34, 103, 0], 1));
+    d.seek_to(0, 590).unwrap();
+    let got = drain(&mut *d);
+    assert_eq!(got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), frames[6..]);
+    assert_eq!(got[0].1, Some(627));
+}
+
+#[test]
+fn a_single_complete_frame_at_eof_survives_resynchronization() {
+    let expected = frame(false, 9);
+    let mut stream = vec![0x12; 13];
+    stream.extend_from_slice(&expected);
+    for tail in [&[][..], &[0xff, 0xf3, 0x40, 0xc0, 0x12][..]] {
+        // A partial next header/frame must not become a packet at EOF.
+        let mut bytes = stream.clone();
+        bytes.extend_from_slice(tail);
+        let mut d = open(avi(&bytes, &[14, 33, 0], 1));
+        assert_eq!(drain(&mut *d), vec![(expected.clone(), Some(13))]);
+        assert!(matches!(d.next_packet(), Err(Error::Eof)));
+    }
+}
+
 /// `open_avi` validates: it names the dwSampleSize the codec's carriage
 /// does not allow, where the registry's demuxer plays the file.
 #[test]

@@ -7773,14 +7773,12 @@ impl Demuxer for AviDemuxer {
         loop {
             // The whole MPEG audio frames of the last chunk of a
             // byte-counted stream come out before the next chunk is read.
-            if let Some(pkt) = self.next_mpa_frame() {
+            if let Some(pkt) = self.next_mpa_frame(false) {
                 return Ok(pkt);
             }
-            let current_end = self
-                .movi_segments
-                .get(self.current_segment)
-                .map(|s| s.1)
-                .ok_or(Error::Eof)?;
+            let Some(&(_, current_end)) = self.movi_segments.get(self.current_segment) else {
+                return self.finish_mpa();
+            };
             // File-absolute offset of this chunk's 8-byte header. The
             // per-chunk keyframe map (`keyframe_by_offset`) is keyed on
             // exactly this position, so capture it before consuming the
@@ -7795,14 +7793,14 @@ impl Demuxer for AviDemuxer {
                     self.input.seek(SeekFrom::Start(next_start))?;
                     continue;
                 }
-                return Err(Error::Eof);
+                return self.finish_mpa();
             }
             // Lenient header read: a short read at the segment tail
             // (truncated-head AVI; segment_end = file_len) means "stop"
             // rather than "I/O error".
             let hdr = match read_chunk_header_lenient(&mut *self.input)? {
                 Some(h) => h,
-                None => return Err(Error::Eof),
+                None => return self.finish_mpa(),
             };
             // `LIST rec ` is an optional grouping inside movi — some writers
             // cluster chunks this way. Recurse by entering the list body.
@@ -7818,7 +7816,7 @@ impl Demuxer for AviDemuxer {
             let body_end = self.input.stream_position()? + hdr.size as u64;
             let cut_by_eof = body_end > self.file_len && current_end >= self.file_len;
             if body_end > current_end && !cut_by_eof {
-                return Err(Error::Eof);
+                return self.finish_mpa();
             }
             if hdr.id == *b"JUNK" || hdr.id == *b"junk" {
                 skip_chunk(&mut *self.input, &hdr)?;
@@ -7925,7 +7923,7 @@ impl Demuxer for AviDemuxer {
                         let data = read_body_partial(&mut *self.input, hdr.size)?;
                         let corrupt = data.len() < hdr.size as usize;
                         if data.is_empty() && corrupt {
-                            return Err(Error::Eof);
+                            return self.finish_mpa();
                         }
                         if !corrupt {
                             skip_pad(&mut *self.input, hdr.size)?;
@@ -11962,6 +11960,8 @@ struct MpaSplitter {
     at: u64,
     /// A frame has come out since open or the last seek.
     timed: bool,
+    /// The next byte is a confirmed frame boundary, not a seek into payload.
+    synced: bool,
 }
 
 impl MpaSplitter {
@@ -11973,26 +11973,57 @@ impl MpaSplitter {
         self.buf.extend_from_slice(data);
     }
 
-    /// The next whole frame and its stream byte, junk before it skipped;
-    /// None until the buffer holds one.
-    fn frame(&mut self) -> Option<(Vec<u8>, u64)> {
-        let start = self.buf.windows(4).position(|h| mpa_frame_len([h[0], h[1], h[2], h[3]]).is_some_and(|n| n >= 4));
-        let Some(start) = start else {
-            // Keep a header the next chunk may complete.
-            let keep = self.buf.len().min(3);
-            self.at += (self.buf.len() - keep) as u64;
-            self.buf.drain(..self.buf.len() - keep);
-            return None;
-        };
+    /// The next whole frame and its stream byte. After a seek or lost sync,
+    /// confirm the following boundary before accepting a header: compressed
+    /// payload can contain a syntactically valid MPEG header too.
+    fn frame(&mut self, eof: bool) -> Option<(Vec<u8>, u64)> {
+        let mut start = 0;
+        while self.buf.len() - start >= 4 {
+            let header: [u8; 4] = self.buf[start..start + 4].try_into().unwrap();
+            let Some(len) = mpa_frame_len(header) else {
+                self.synced = false;
+                start += 1;
+                continue;
+            };
+            let end = start + len;
+            if end > self.buf.len() {
+                if !eof || self.synced {
+                    break;
+                }
+                // An unconfirmed, incomplete candidate must not hide a
+                // later complete frame when no more bytes can arrive.
+                start += 1;
+                continue;
+            }
+            if !self.synced {
+                if end + 4 > self.buf.len() {
+                    if !eof {
+                        break;
+                    }
+                } else {
+                    let next: [u8; 4] = self.buf[end..end + 4].try_into().unwrap();
+                    // Version, layer and sample rate must agree. Bitrate,
+                    // padding, CRC and channel mode may change.
+                    const FORMAT_MASK: u32 = 0x001e_0c00;
+                    if mpa_frame_len(next).is_none()
+                        || (u32::from_be_bytes(header) ^ u32::from_be_bytes(next)) & FORMAT_MASK != 0
+                    {
+                        start += 1;
+                        continue;
+                    }
+                }
+            }
+            self.buf.drain(..start);
+            self.at += start as u64;
+            let at = self.at;
+            self.at += len as u64;
+            self.synced = true;
+            return Some((self.buf.drain(..len).collect(), at));
+        }
+        // Keep a candidate or partial header for the next AVI chunk.
         self.buf.drain(..start);
         self.at += start as u64;
-        let len = mpa_frame_len([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])?;
-        if self.buf.len() < len {
-            return None;
-        }
-        let at = self.at;
-        self.at += len as u64;
-        Some((self.buf.drain(..len).collect(), at))
+        None
     }
 
     fn reset(&mut self) {
@@ -12004,11 +12035,11 @@ impl AviDemuxer {
     /// The next whole frame of the byte-counted MPEG audio stream whose
     /// chunk was read last; the first after open or a seek is timed by
     /// the byte it starts at, later ones by the decoder's output.
-    fn next_mpa_frame(&mut self) -> Option<Packet> {
+    fn next_mpa_frame(&mut self, eof: bool) -> Option<Packet> {
         let idx = self.mpa_ready?;
         let tick = self.ticks[idx];
         let split = self.mpa.get_mut(idx)?.as_mut()?;
-        let Some((data, at)) = split.frame() else {
+        let Some((data, at)) = split.frame(eof) else {
             self.mpa_ready = None;
             return None;
         };
@@ -12019,6 +12050,18 @@ impl AviDemuxer {
         pkt.dts = pts;
         pkt.flags.keyframe = true;
         Some(pkt)
+    }
+
+    /// Release complete terminal frames that were waiting for lookahead.
+    fn finish_mpa(&mut self) -> Result<Packet> {
+        for idx in 0..self.mpa.len() {
+            self.mpa_ready = Some(idx);
+            if let Some(packet) = self.next_mpa_frame(true) {
+                return Ok(packet);
+            }
+        }
+        self.mpa_ready = None;
+        Err(Error::Eof)
     }
 
     /// Drops the MPEG audio frames in progress (after a seek).
