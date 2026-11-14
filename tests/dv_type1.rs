@@ -6,7 +6,9 @@
 
 use std::io::Cursor;
 
-use oxideav_core::{CodecId, CodecInfo, CodecRegistry, CodecTag, Demuxer, Error, MediaType, ReadSeek};
+use oxideav_core::{
+    CodecId, CodecInfo, CodecRegistry, CodecTag, Demuxer, Error, MediaType, ReadSeek,
+};
 
 fn chunk(fcc: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = fcc.to_vec();
@@ -42,7 +44,10 @@ fn type1(fcc_type: &[u8; 4], handler: &[u8; 4], frames: &[Vec<u8>], extra: &[u8]
         strh.extend_from_slice(&v.to_le_bytes());
     }
     let strl = [chunk(b"strh", &strh), chunk(b"strf", &[0; 32])].concat();
-    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), list(b"strl", &strl)].concat());
+    let hdrl = list(
+        b"hdrl",
+        &[chunk(b"avih", &avih), list(b"strl", &strl)].concat(),
+    );
     let mut movi = Vec::new();
     let mut idx1 = Vec::new();
     for f in frames {
@@ -53,8 +58,19 @@ fn type1(fcc_type: &[u8; 4], handler: &[u8; 4], frames: &[Vec<u8>], extra: &[u8]
         movi.extend_from_slice(&chunk(b"00__", f));
     }
     movi.extend_from_slice(extra);
-    let body = [b"AVI ".to_vec(), hdrl, list(b"movi", &movi), chunk(b"idx1", &idx1)].concat();
-    [b"RIFF".to_vec(), (body.len() as u32).to_le_bytes().to_vec(), body].concat()
+    let body = [
+        b"AVI ".to_vec(),
+        hdrl,
+        list(b"movi", &movi),
+        chunk(b"idx1", &idx1),
+    ]
+    .concat();
+    [
+        b"RIFF".to_vec(),
+        (body.len() as u32).to_le_bytes().to_vec(),
+        body,
+    ]
+    .concat()
 }
 
 fn frames() -> Vec<Vec<u8>> {
@@ -63,7 +79,10 @@ fn frames() -> Vec<Vec<u8>> {
 
 fn open(file: Vec<u8>) -> Box<dyn Demuxer> {
     let mut reg = CodecRegistry::new();
-    reg.register(CodecInfo::new(CodecId::new("dvvideo")).tags([CodecTag::fourcc(b"dvsd"), CodecTag::fourcc(b"dvhd")]));
+    reg.register(
+        CodecInfo::new(CodecId::new("dvvideo"))
+            .tags([CodecTag::fourcc(b"dvsd"), CodecTag::fourcc(b"dvhd")]),
+    );
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
     oxideav_avi::demuxer::open(rs, &reg).unwrap()
 }
@@ -85,11 +104,24 @@ fn the_dv_stream_is_its_video_and_its_audio() {
     let d = open(type1(b"iavs", b"dvsd", &frames(), &[]));
     let s = d.streams();
     assert_eq!(s.len(), 2);
-    assert_eq!((s[0].params.media_type, s[0].params.codec_id.as_str()), (MediaType::Video, "dvvideo"));
-    assert_eq!((s[1].params.media_type, s[1].params.codec_id.as_str()), (MediaType::Audio, "dvaudio"));
-    assert_eq!(s[1].params.tag, Some(CodecTag::fourcc(b"dvsd")), "audio carried in dvsd frames");
+    assert_eq!(
+        (s[0].params.media_type, s[0].params.codec_id.as_str()),
+        (MediaType::Video, "dvvideo")
+    );
+    assert_eq!(
+        (s[1].params.media_type, s[1].params.codec_id.as_str()),
+        (MediaType::Audio, "dvaudio")
+    );
+    assert_eq!(
+        s[1].params.tag,
+        Some(CodecTag::fourcc(b"dvsd")),
+        "audio carried in dvsd frames"
+    );
     assert_eq!(s[1].index, 1);
-    assert_eq!((s[1].time_base, s[1].duration), (s[0].time_base, s[0].duration));
+    assert_eq!(
+        (s[1].time_base, s[1].duration),
+        (s[0].time_base, s[0].duration)
+    );
     assert_eq!(s[0].duration, Some(3));
 }
 
@@ -99,7 +131,14 @@ fn each_frame_comes_out_on_both_streams() {
     let mut d = open(type1(b"iavs", b"dvsd", &f, &[]));
     assert_eq!(
         drain(&mut *d),
-        vec![(0, 1, Some(0)), (1, 1, Some(0)), (0, 2, Some(1)), (1, 2, None), (0, 3, Some(2)), (1, 3, None)]
+        vec![
+            (0, 1, Some(0)),
+            (1, 1, Some(0)),
+            (0, 2, Some(1)),
+            (1, 2, None),
+            (0, 3, Some(2)),
+            (1, 3, None)
+        ]
     );
 }
 
@@ -125,7 +164,12 @@ fn ivas_with_a_dvhd_handler_too() {
 /// packets.
 #[test]
 fn a_chunk_numbered_for_the_audio_stream_is_skipped() {
-    let mut d = open(type1(b"iavs", b"dvsd", &frames(), &chunk(b"01wb", &[9; 10])));
+    let mut d = open(type1(
+        b"iavs",
+        b"dvsd",
+        &frames(),
+        &chunk(b"01wb", &[9; 10]),
+    ));
     let got = drain(&mut *d);
     assert_eq!(got.len(), 6);
     assert!(got.iter().all(|&(_, byte, _)| byte != 9));

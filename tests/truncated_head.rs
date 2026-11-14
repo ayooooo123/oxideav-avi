@@ -134,8 +134,17 @@ fn build_video_avi(tag: &str, frames: &[Vec<u8>]) -> Vec<u8> {
     params.width = Some(64);
     params.height = Some(48);
     params.tag = Some(CodecTag::fourcc(b"VP50"));
-    let stream = StreamInfo { index: 0, time_base: TimeBase::new(1, 25), duration: None, start_time: Some(0), params };
-    let tmp = std::env::temp_dir().join(format!("oxideav-avi-trunc-{tag}-{}.avi", std::process::id()));
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 25),
+        duration: None,
+        start_time: Some(0),
+        params,
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "oxideav-avi-trunc-{tag}-{}.avi",
+        std::process::id()
+    ));
     {
         let ws: Box<dyn WriteSeek> = Box::new(std::fs::File::create(&tmp).unwrap());
         let mut mux = oxideav_avi::muxer::open(ws, std::slice::from_ref(&stream)).unwrap();
@@ -226,7 +235,11 @@ fn physical_truncation_keeps_the_partial_tail_packet() {
         assert_eq!(data.len(), 256 * 4, "packet {i} is a full block");
         assert!(!corrupt, "packet {i} is whole");
     }
-    assert_eq!(got[3].0.len(), 256 * 4 - lost_from_body, "the bytes the file still has");
+    assert_eq!(
+        got[3].0.len(),
+        256 * 4 - lost_from_body,
+        "the bytes the file still has"
+    );
     assert!(got[3].1, "the cut packet is flagged corrupt");
 }
 
@@ -286,7 +299,10 @@ fn video_cut_inside_its_last_frame_keeps_the_frame() {
     let buf = build_video_avi("video-cut", &frames);
     // The last frame's chunk header: the last `00dc` before idx1.
     let idx1 = find_fourcc(&buf, b"idx1").expect("muxer emits idx1");
-    let last = buf[..idx1].windows(4).rposition(|w| w == b"00dc").expect("a video chunk");
+    let last = buf[..idx1]
+        .windows(4)
+        .rposition(|w| w == b"00dc")
+        .expect("a video chunk");
     let mut cut = buf;
     cut.truncate(last + 8 + 100);
     let got = drain(cut);
@@ -295,7 +311,11 @@ fn video_cut_inside_its_last_frame_keeps_the_frame() {
         assert_eq!(data, &frames[i], "frame {i}");
         assert!(!corrupt);
     }
-    assert_eq!(got[4].0, frames[4][..100], "the present part of the last frame");
+    assert_eq!(
+        got[4].0,
+        frames[4][..100],
+        "the present part of the last frame"
+    );
     assert!(got[4].1, "flagged corrupt");
 }
 

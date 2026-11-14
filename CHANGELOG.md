@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- All-field `new(..)` constructors for the demuxer's validator and
+  index records (`BlockAlignViolation`, `PaletteChangeFlagViolation`,
+  `SuperIndexDurationViolation`, `StdIndexBaseOffsetViolation`,
+  `StdIndexEntryCountViolation`, `SuperIndexEntryInfo`,
+  `SuperIndexTargetViolation`, `KeyframeSeekResult`) and `with_*`
+  setters for every field of `AudioStrfInfo` / `VideoStrfInfo`.
+- Type-1 DV (an `iavs`/`ivas` stream with a `dvsd`/`dvhd`/`dvsl`
+  handler, as FFmpeg's avidec reads it): the stream is the DV video, and
+  the demuxer adds a `dvaudio` stream of the same DIF frames (tagged with
+  the DV FourCC) for the DV audio decoder. Its first packet after open or
+  a seek carries the frame's pts; later ones carry none, since frames
+  hold varying sample counts. Such files gave no packets at all (their
+  `00__` chunks matched no stream).
+
+### Changed
+
+- API hygiene: `#[non_exhaustive]` on the `muxer::RiffSegmentLimit` enum
+  and on the records `muxer::AviMuxOptions`, `muxer::VprpConfig` (build
+  them with `Default` + their `with_*` builders), `demuxer::AudioStrfInfo`,
+  `demuxer::VideoStrfInfo`, the eight validator / index records above and
+  `demuxer::KeyframeSeekResult`. Fixed-layout wire records (chunk bodies,
+  flag views, `BITMAPINFOHEADER` / `WAVEFORMATEX(TENSIBLE)`, palette
+  entries, `VIDEO_FIELD_DESC`) and `AviKind` (the two envelope forms)
+  stay exhaustive.
+
 ### Fixed
 
 - Byte-counted MPEG audio re-establishes frame boundaries after a seek
@@ -25,29 +52,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Timestamps advance as avidec's `get_duration`: by bytes over the sample
   size (set to nBlockAlign when they differ; dropped for 1152-sample MP3
   and 1024/4096 AAC frames declared as both), by started nBlockAlign
-  blocks when there is no sample size, else one per packet. Byte-counted
-  compressed audio was one tick per chunk, and A-law/µ-law were counted
-  by their decoded sample width.
+  blocks for PCM-family audio with no sample size, else one per packet.
+  Byte-counted compressed audio was one tick per chunk, and A-law/µ-law
+  were counted by their decoded sample width.
 - MPEG audio stored by the byte is split into whole frames, as FFmpeg's
   parser splits it, across chunk boundaries; the first frame after open
   or a seek is timed by the byte it starts at, later ones by the decoder.
-
-### Added
-
-- Type-1 DV (an `iavs`/`ivas` stream with a `dvsd`/`dvhd`/`dvsl`
-  handler, as FFmpeg's avidec reads it): the stream is the DV video, and
-  the demuxer adds a `dvaudio` stream of the same DIF frames (tagged with
-  the DV FourCC) for the DV audio decoder. Its first packet after open or
-  a seek carries the frame's pts; later ones carry none, since frames
-  hold varying sample counts. Such files gave no packets at all (their
-  `00__` chunks matched no stream).
-
-### Fixed
-
 - A chunk the end of the file cuts short comes out with the bytes present,
   flagged corrupt, as FFmpeg's `av_get_packet` returns a short read (it
   was dropped, one frame short of FFmpeg on cut-off files such as FATE's
   vp5/potter512-400-partial.avi).
+
+## [0.0.11](https://github.com/OxideAV/oxideav-avi/compare/v0.0.10...v0.0.11) - 2026-11-07
+
+### Other
+
+- ffmpeg decodes real JPEG frames muxed here to the raw stream's pictures; crate doc states OpenDML support
+- compressed audio is one codec frame per chunk; round-trip matrix for every codec id
+- zero-length data chunks are frame-time slots, not packets
+- untagged streams get their codec's canonical FourCC / wFormatTag — mjpeg writes as MJPG
+- decoded pixel format for H.264 / H.265 / VP9 / AV1 from their parameter sets; reduced frame_rate
+- uncompressed DIB / RGBA video is rawvideo + an explicit pixel format
+- edition 2024, MSRV 1.95
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- README examples use the current registry API
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
+### Added
+
+- **Motion JPEG is written to AVI.** A stream whose parameters carry no
+  container tag — what an encoder states — now gets its canonical
+  FourCC / `wFormatTag` from the codec id: `mjpeg` → `MJPG` (OpenDML
+  §7.0), plus `cinepak` / `h261` / `h263` / `indeo3` / `indeo5` /
+  `huffyuv` / `lagarith` / `msmpeg4v1..3` / `mpeg4video` / `vp6` /
+  `h264` / `h265` / `vp8` / `vp9` / `av1` / `ffv1` / `mpeg1video` /
+  `mpeg2video` / `svq1`, and `pcm_alaw` / `pcm_mulaw` / `mp1` / `mp2` /
+  `mp3` (RFC 2361). `params.tag` still wins when set. Every `MJPG` chunk
+  is indexed as a key frame and read back as one ("all JPEG frames will
+  be key frames", OpenDML §7.0).
+- **Zero-length data chunks are frame-time slots, not packets.** The
+  dropped / repeated-frame placeholders capture and transcoding writers
+  leave (an empty `00dc`) used to reach the decoder as empty packets
+  (an MJPEG decoder failed on them with "missing SOI"). The demuxer now
+  skips them for every codec while the stream clock still counts them
+  (`dwSampleSize` 0: one chunk per frame; only `AVIIF_NO_TIME` chunks do
+  not affect timing), so the next frame keeps its timestamp; they are
+  never seek landing points and `packet_is_keyframe` /
+  `keyframe_indexed_packet_count` follow the packets actually returned.
+  The muxer writes them: a video packet whose `dts` lies past the next
+  frame slot is preceded by one zero-length chunk per skipped slot.
+  Checked against ffprobe on ffmpeg-made MJPEG and MPEG-4 + PCM
+  fixtures with dropped frames.
+- `tests/codec_matrix.rs`: every codec id the muxer accepts — 22
+  untagged video ids, 4 tag-only video ids, 5 `rawvideo` pixel formats,
+  6 PCM depths, 5 untagged + 4 tag-only compressed audio ids, and an
+  interleaved MJPEG + MP3 + PCM file — goes mux → demux in AVI 1.0 and
+  OpenDML and comes back with the same codec id, tag, shape, packet
+  bytes, key-frame flags and (exact-rational) timestamps.
+- Compressed-FourCC video states `biSizeImage` as the decoded image
+  size (`biWidth × biHeight × biBitCount / 8`) instead of `0`, which the
+  `BITMAPINFOHEADER` allows only for uncompressed RGB.
+
+- **H.264 / H.265 / VP9 / AV1 streams report their decoded pixel
+  format.** The `BITMAPINFOHEADER` does not state it for compressed
+  video, so the demuxer reads the codec's parameter sets — a
+  configuration record (`avcC` / `hvcC` / `av1C`) or Annex B NAL units
+  after the header when the writer put them there, else the stream's
+  first frame in `movi` (H.264 / H.265 SPS, VP9 key-frame header, AV1
+  Sequence Header OBU), found by a bounded chunk walk at open. The SPS
+  cropping window also gives `width` / `height` when the header
+  declares the coded size. Motion JPEG stays `None`: nothing in the
+  header or the `MJPG` FourCC states its sampling. Verified against
+  ffprobe on ffmpeg-made fixtures in `tests/stream_parameters.rs`.
+
+### Fixed
+
+- **Compressed-audio timing.** With `dwSampleSize` 0 "each sample of
+  data … must be in a separate chunk" (AVI 1.0 §AVISTREAMHEADER), so a
+  chunk is one tick of `dwScale / dwRate`. The muxer wrote
+  `1 / sample_rate` with `dwLength` in samples, so a reader counting
+  chunks put every MP3 / MP2 / AC-3 / AAC frame one sample after the
+  last. It now stamps `dwScale / dwRate` = one codec frame (from the
+  first packet's `duration`, else its `pts` step; reduced — `mp2` at
+  44.1 kHz is `32 / 1225`, as ffprobe reads it) and `dwLength` counts
+  frames. IMA ADPCM (`0x0011`) is written CBR (`dwSampleSize` =
+  `nBlockAlign` = the block size), which the strict demuxer requires
+  and used to refuse in the muxer's own output.
+- The demuxer derives each chunk's tick span from `dwSampleSize` (a
+  nonzero one divides the chunk, AVI 1.0 §AVISTREAMHEADER), falling back
+  to `nBlockAlign` / the on-wire sample width only for PCM-family
+  streams whose writer left it 0. A-law / µ-law used to be divided by
+  the decoded S16 width, halving every timestamp, and compressed audio
+  with a 16-bit `wBitsPerSample` was divided as if it were PCM.
+
+- `seek_to` in a multi-segment OpenDML file used the `idx1` keyframe
+  table, which covers the primary `RIFF AVI ` only, and so landed before
+  any key frame in a `RIFF AVIX` continuation; it now walks the `ix##`
+  standard indexes whenever the file has more than one segment.
+
+- `frame_rate` is `dwRate / dwScale` reduced, and `None` when either is
+  zero (was the unreduced pair, with a zero clamped to 1).
+
+- Uncompressed video (`BI_RGB` 16/24/32 bpp, `BI_BITFIELDS` 16/32 bpp
+  with the standard masks, the `RGBA` FourCC) surfaces as the fleet's
+  `rawvideo` codec with an explicit pixel format (`Rgb555Le` / `Bgr24` /
+  `Bgrx` / `Rgb565Le` / … / `Rgba`) instead of `rgb24` / `avi:RGBA`, so
+  it decodes. Packets are re-laid-out to packed top-down rows: bottom-up
+  DIBs (positive `biHeight`) are flipped and DWORD row padding dropped.
+- The muxer packages `rawvideo` streams of those pixel formats as a
+  top-down DIB (negative `biHeight`, `BI_BITFIELDS` masks where needed,
+  rows padded to the DWORD stride) or the `RGBA` FourCC.
+
+### Changed
+
+- edition 2024, MSRV 1.95.
 
 ## [0.0.10](https://github.com/OxideAV/oxideav-avi/compare/v0.0.9...v0.0.10) - 2026-08-13
 

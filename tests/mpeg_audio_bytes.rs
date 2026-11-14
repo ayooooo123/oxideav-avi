@@ -39,7 +39,20 @@ fn avi(stream: &[u8], sizes: &[usize], sample_size: u32) -> Vec<u8> {
     // dwFlags, wPriority + wLanguage, dwInitialFrames, dwScale, dwRate,
     // dwStart, dwLength, dwSuggestedBufferSize, dwQuality, dwSampleSize,
     // rcFrame
-    for v in [0u32, 0, 0, 1, 3981, 0, stream.len() as u32, 1845, u32::MAX, sample_size, 0, 0] {
+    for v in [
+        0u32,
+        0,
+        0,
+        1,
+        3981,
+        0,
+        stream.len() as u32,
+        1845,
+        u32::MAX,
+        sample_size,
+        0,
+        0,
+    ] {
         strh.extend_from_slice(&v.to_le_bytes());
     }
     let mut strf = Vec::new();
@@ -61,7 +74,11 @@ fn avi(stream: &[u8], sizes: &[usize], sample_size: u32) -> Vec<u8> {
     let mut idx1 = Vec::new();
     let mut at = 0;
     for (i, &n) in sizes.iter().enumerate() {
-        let n = if i + 1 == sizes.len() { stream.len() - at } else { n };
+        let n = if i + 1 == sizes.len() {
+            stream.len() - at
+        } else {
+            n
+        };
         idx1.extend_from_slice(b"00wb");
         for v in [0x10u32, movi.len() as u32, n as u32] {
             idx1.extend_from_slice(&v.to_le_bytes());
@@ -113,9 +130,16 @@ fn chunks_cut_through_frames_come_out_as_whole_frames() {
     let stream: Vec<u8> = frames.concat();
     let mut d = open(avi(&stream, &[250, 333, 41, 600, 0], 1));
     let got = drain(&mut *d);
-    assert_eq!(got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), frames, "every frame whole, in order");
+    assert_eq!(
+        got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+        frames,
+        "every frame whole, in order"
+    );
     assert_eq!(got[0].1, Some(0));
-    assert!(got[1..].iter().all(|(_, pts)| pts.is_none()), "later frames are the decoder's to time");
+    assert!(
+        got[1..].iter().all(|(_, pts)| pts.is_none()),
+        "later frames are the decoder's to time"
+    );
 }
 
 /// A seek lands on the chunk holding the target byte time and times its
@@ -151,7 +175,10 @@ fn seek_skips_payload_sync_patterns_before_timing_a_frame() {
         let mut d = open(avi(&stream, &[250, 333, 11, 34, 103, 0], 1));
         assert_eq!(d.seek_to(0, 590).unwrap(), 583);
         let got = drain(&mut *d);
-        assert_eq!(got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), frames[6..]);
+        assert_eq!(
+            got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+            frames[6..]
+        );
         assert_eq!(got[0].1, Some(627));
         assert!(got[1..].iter().all(|(_, pts)| pts.is_none()));
         // A later seek must discard the previous framing lock too.
@@ -170,7 +197,10 @@ fn resynchronization_keeps_variable_bitrate_and_final_frames() {
     let mut d = open(avi(&frames.concat(), &[250, 333, 11, 34, 103, 0], 1));
     d.seek_to(0, 590).unwrap();
     let got = drain(&mut *d);
-    assert_eq!(got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(), frames[6..]);
+    assert_eq!(
+        got.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>(),
+        frames[6..]
+    );
     assert_eq!(got[0].1, Some(627));
 }
 
@@ -195,6 +225,8 @@ fn a_single_complete_frame_at_eof_survives_resynchronization() {
 fn the_validating_open_still_names_the_mismatch() {
     let stream: Vec<u8> = frames().concat();
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(avi(&stream, &[1845], 1)));
-    let err = oxideav_avi::demuxer::open_avi(rs, &NullCodecResolver).err().expect("open_avi validates");
+    let err = oxideav_avi::demuxer::open_avi(rs, &NullCodecResolver)
+        .err()
+        .expect("open_avi validates");
     assert!(err.to_string().contains("dwSampleSize"), "{err}");
 }

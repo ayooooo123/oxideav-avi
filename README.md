@@ -164,12 +164,34 @@ decoder.
 | `indeo3`/`indeo4`/`indeo5` | `IV31`/`IV32`, `IV41`/`IV42`, `IV50`                                                  |
 | `svq1` / `svq3`| `SVQ1`, `SVQ3`                                                                                  |
 | `flv1`         | `FLV1`                                                                                          |
-| `rgb24`        | `BI_RGB` (all-zero FourCC), `DIB `, `RGB `, `RAW `                                              |
+| `rgb24`        | `DIB `, `RGB `, `RAW ` (resolver claims; header-defined DIBs map to `rawvideo`, below)           |
 | `yuyv422` / `uyvy422` | `YUY2`/`YUYV`/`V422`/`YUNV`, `UYVY`/`Y422`/`UYNV`                                        |
 | `nv12` / `nv21`| `NV12`, `NV21`                                                                                  |
 | `yuv420p`      | `I420`, `IYUV`, `YV12`                                                                          |
 | `yuv411p`      | `Y41P`                                                                                          |
 | `yuv444p10le` / `v210` / `r210` | `V410`, `V210`, `R210`/`R10K`                                                  |
+
+### Uncompressed video → `rawvideo`
+
+Header-defined uncompressed layouts bypass the tag resolver and surface
+as codec id `rawvideo` with `CodecParameters::pixel_format` set; packets
+are re-laid-out to the packed top-down rows the `rawvideo` decoder
+takes (bottom-up DIBs — positive `biHeight` — are flipped, DWORD row
+padding is dropped; already-packed top-down frames pass through as-is):
+
+| `biCompression` / `biBitCount` | pixel format |
+|--------------------------------|--------------|
+| `BI_RGB` 16 | `Rgb555Le` |
+| `BI_RGB` 24 | `Bgr24` |
+| `BI_RGB` 32 | `Bgrx` (high byte unused) |
+| `BI_BITFIELDS` 16, masks 7C00/03E0/001F · F800/07E0/001F · 001F/03E0/7C00 · 001F/07E0/F800 | `Rgb555Le` · `Rgb565Le` · `Bgr555Le` · `Bgr565Le` |
+| `BI_BITFIELDS` 32, masks FF0000/FF00/FF · FF/FF00/FF0000 · FF00/FF0000/FF000000 · FF000000/FF0000/FF00 | `Bgrx` · `Rgbx` · `Xrgb` · `Xbgr` |
+| `RGBA` 32 | `Rgba` (packed, top-down) |
+
+The muxer writes `rawvideo` streams of those pixel formats back as a
+top-down DIB (negative `biHeight`, rows padded to the DWORD stride) or
+the `RGBA` FourCC; other pixel formats are refused at `open`. Palettised
+(1/4/8 bpp) DIBs keep the legacy path.
 
 ### Audio wFormatTag to codec id
 
@@ -200,18 +222,49 @@ decoder.
 | `vorbis`       | `0x674F`/`0x6750`/`0x6751`/`0x676F`/`0x6770`/`0x6771`          |
 | `flac`         | `0xF1AC`                                                       |
 
-Muxer-side packaging (`strf` + `strh`) is implemented for a subset of
-the above: `mjpeg`, `ffv1`, `mpeg1video`, `mpeg2video`, `mpeg4video`,
-`h263`, `h264`, `h265`, `vp8`, `vp9`, `av1`, `magicyuv`, `rgb24`, all
-six raw PCM variants (`pcm_u8`/`s16le`/`s24le`/`s32le`/`f32le`/`f64le`),
-`pcm_alaw`, `pcm_mulaw`, `mp2`, `mp3`, `aac`, `ac3`, `eac3`, `flac`.
-Other codec ids return `Error::Unsupported` at `open()`.
+The muxer writes `CodecParameters::tag` when it is set (the demuxer
+sets it, so a remux keeps the original FourCC / `wFormatTag`). A stream
+with no tag — what an encoder states — gets the canonical one for its
+codec id:
 
-For codec ids that share several FourCCs (e.g. `mpeg4video` →
-`XVID`/`DIVX`/...; `magicyuv` → 17 native FourCCs), the muxer picks a
-default FourCC unless the caller hints otherwise. For `magicyuv`, the
-hint is the leading 4 bytes of `CodecParameters::extradata` if they
-spell one of the 17 native FourCCs; otherwise `M8RG` is used.
+| Codec id | Written as | Codec id | Written as |
+|----------|-----------|----------|-----------|
+| `mjpeg` | `MJPG` | `h264` | `H264` |
+| `cinepak` | `CVID` | `h265` / `hevc` | `HEVC` |
+| `h261` / `h263` | `H261` / `H263` | `vp8` / `vp9` | `VP80` / `VP90` |
+| `indeo3` / `indeo5` | `IV32` / `IV50` | `av1` | `AV01` |
+| `huffyuv` / `lagarith` | `HFYU` / `LAGS` | `ffv1` | `FFV1` |
+| `msmpeg4v1` / `v2` / `v3` | `MPG4` / `MP42` / `MP43` | `mpeg1video` / `mpeg2video` | `MPG1` / `MPG2` |
+| `mpeg4video` | `XVID` | `svq1` | `SVQ1` |
+| `vp6` | `VP62` | `rawvideo` | DIB / `RGBA` from the pixel format |
+| `pcm_*` | `0x0001` / `0x0003` by depth | `pcm_alaw` / `pcm_mulaw` | `0x0006` / `0x0007` |
+| `mp1` / `mp2` | `0x0050` | `mp3` | `0x0055` |
+
+Compressed audio is one codec frame per chunk: the muxer stamps
+`dwScale / dwRate` = the frame duration (from the first packet's
+`duration`, else its `pts` step) so readers that count chunks get the
+right clock, and `dwLength` counts frames. `tests/codec_matrix.rs`
+round-trips every id above through both AVI 1.0 and OpenDML.
+
+Other untagged codec ids return `Error::Unsupported` at `open()`; set
+`params.tag` for them, or for a multi-FourCC codec such as `magicyuv`
+(or spell the FourCC in the leading 4 bytes of `extradata`). An `MJPG`
+stream is indexed and read back all-key ("all JPEG frames will be key
+frames", OpenDML §7.0).
+
+## Dropped frames (zero-length chunks)
+
+Capture and transcoding writers mark a dropped / repeated frame with a
+zero-length `##dc` chunk. With `dwSampleSize` 0 every chunk is one
+frame-time slot (AVI 1.0 §AVISTREAMHEADER), so the demuxer does not
+return such a chunk as a packet — there is nothing to decode — but
+advances the stream clock past it: the next real packet keeps its own
+timestamp and the `pts` gap says the previous picture stays up. Seeks
+never land on a placeholder, and `packet_is_keyframe` counts the same
+packets `next_packet` returns. The muxer writes the placeholders back:
+a video packet whose `dts` lies past the next frame slot gets one
+zero-length chunk per skipped slot first (no filler for packets without
+`dts`, or for a jump of more than 65 536 frames).
 
 ## Quick use
 

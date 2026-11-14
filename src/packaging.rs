@@ -20,8 +20,9 @@
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result, SampleFormat};
 
 use crate::stream_format::{
-    write_bitmap_info_header, write_bitmap_info_header_oriented, write_indexed_bitmap_info_header,
-    write_waveformatex, write_waveformatextensible, Guid, RgbQuad, WAVE_FORMAT_EXTENSIBLE,
+    Guid, RgbQuad, WAVE_FORMAT_EXTENSIBLE, write_bitmap_info_header,
+    write_bitmap_info_header_oriented, write_indexed_bitmap_info_header, write_waveformatex,
+    write_waveformatextensible,
 };
 
 /// Result of building a stream-format chunk for the muxer.
@@ -42,6 +43,10 @@ pub(crate) struct StrfEntry {
     /// per second). For video we use frame_rate; for audio sample_rate/1.
     pub scale: u32,
     pub rate: u32,
+    /// `rawvideo` streams whose on-wire rows differ from the packed
+    /// top-down packet layout (DWORD row padding): each packet is
+    /// re-laid-out before it is written.
+    pub raw_layout: Option<crate::raw_dib::RawLayout>,
 }
 
 /// Build the `strf` chunk + `strh` metadata for the given stream.
@@ -88,10 +93,10 @@ pub(crate) fn build_strf(
             // container-layout fields (`wBitsPerSample`, `nBlockAlign`)
             // stay owned by the PCM/codec packaging since they determine
             // byte-stream framing and the CBR sample-size invariant.
-            if let Some(avg) = avg_bytes_per_sec {
-                if entry.strf.len() >= 12 {
-                    entry.strf[8..12].copy_from_slice(&avg.to_le_bytes());
-                }
+            if let Some(avg) = avg_bytes_per_sec
+                && entry.strf.len() >= 12
+            {
+                entry.strf[8..12].copy_from_slice(&avg.to_le_bytes());
             }
             Ok(entry)
         }
@@ -112,6 +117,7 @@ pub(crate) fn build_strf(
             let (scale, rate) = (time_base.0.max(1), time_base.1.max(1));
             Ok(StrfEntry {
                 chunk_suffix: *b"tx",
+                raw_layout: None,
                 handler_fourcc: [0u8; 4],
                 strf: params.extradata.clone(),
                 strh_type: *b"txts",
@@ -128,7 +134,8 @@ pub(crate) fn build_strf(
 }
 
 /// Optional caller overrides for the `BITMAPINFOHEADER` scalar fields the
-/// muxer otherwise leaves at their writer-default `0` / `1` per VfW
+/// muxer otherwise leaves at their writer-default (`biSizeImage` = the
+/// decoded image size for a compressed FourCC, otherwise `0` / `1`) per VfW
 /// `wingdi.h` §"BITMAPINFOHEADER". Each field is patched verbatim into
 /// the 40-byte fixed header *after* the default strf is built, so an
 /// override never perturbs `biWidth` / `biHeight` / `biCompression` / the
@@ -200,6 +207,9 @@ fn video_fourcc(params: &CodecParameters) -> Result<[u8; 4]> {
     if let Some(hint) = extradata_fourcc_hint(&params.extradata) {
         return Ok(hint);
     }
+    if let Some(fourcc) = default_video_fourcc(params.codec_id.as_str()) {
+        return Ok(fourcc);
+    }
     if params.codec_id.as_str() == "rgb24" {
         return Ok([0, 0, 0, 0]);
     }
@@ -209,6 +219,63 @@ fn video_fourcc(params: &CodecParameters) -> Result<[u8; 4]> {
          or pre-fill `extradata`'s first 4 bytes with the desired FourCC",
         params.codec_id
     )))
+}
+
+/// The FourCC written for a video codec id whose parameters carry no
+/// `tag` — the encoder-output case (an encoder states its codec id, not a
+/// container tag). One canonical `biCompression` per codec id; a codec
+/// with several FourCCs (MagicYUV, Ut Video, …) still needs `params.tag`.
+///
+/// Sources: `MJPG` — OpenDML AVI File Format Extensions §7.0 ("MJPG
+/// Motion JPEG DIB Extensions"); `CVID` / `IV32` / `IV50` / `HFYU` /
+/// `LAGS` / `MPG4` / `MP42` / `MP43` / `XVID` / `VP62` — the codec list
+/// of `docs/container/vfw/video-for-windows.md`; `H261` / `H263` — the
+/// RFC 2361 Annex B FourCC registry. `H264` / `HEVC` / `VP80` / `VP90` /
+/// `AV01` / `FFV1` / `MPG1` / `MPG2` / `SVQ1` are the FourCCs the
+/// project's own codec crates claim (and, for the first four, the ones
+/// this demuxer reads parameter sets behind).
+pub(crate) fn default_video_fourcc(codec_id: &str) -> Option<[u8; 4]> {
+    Some(*match codec_id {
+        "mjpeg" => b"MJPG",
+        "cinepak" => b"CVID",
+        "h261" => b"H261",
+        "h263" => b"H263",
+        "indeo3" => b"IV32",
+        "indeo5" => b"IV50",
+        "huffyuv" => b"HFYU",
+        "lagarith" => b"LAGS",
+        "msmpeg4v1" => b"MPG4",
+        "msmpeg4v2" => b"MP42",
+        "msmpeg4v3" => b"MP43",
+        "mpeg4video" => b"XVID",
+        "vp6" => b"VP62",
+        "h264" => b"H264",
+        "h265" | "hevc" => b"HEVC",
+        "vp8" => b"VP80",
+        "vp9" => b"VP90",
+        "av1" => b"AV01",
+        "ffv1" => b"FFV1",
+        "mpeg1video" => b"MPG1",
+        "mpeg2video" => b"MPG2",
+        "svq1" => b"SVQ1",
+        _ => return None,
+    })
+}
+
+/// The `wFormatTag` written for an audio codec id whose parameters carry
+/// no `tag` (and that is not in the depth-synthesised PCM family). The
+/// values are the RFC 2361 Annex A registrations:
+/// `WAVE_FORMAT_ALAW` 0x0006, `WAVE_FORMAT_MULAW` 0x0007,
+/// `WAVE_FORMAT_MPEG` 0x0050 (MPEG-1 Layer I / II) and
+/// `WAVE_FORMAT_MPEGLAYER3` 0x0055.
+pub(crate) fn default_audio_format_tag(codec_id: &str) -> Option<u16> {
+    Some(match codec_id {
+        "pcm_alaw" => 0x0006,
+        "pcm_mulaw" => 0x0007,
+        "mp1" | "mp2" => 0x0050,
+        "mp3" => 0x0055,
+        _ => return None,
+    })
 }
 
 /// Pick the wFormatTag for an audio stream.
@@ -226,6 +293,9 @@ fn audio_format_tag(params: &CodecParameters) -> Result<u16> {
     }
     if let Some(synth) = pcm_synth_format_tag(&params.codec_id) {
         return Ok(synth);
+    }
+    if let Some(tag) = default_audio_format_tag(params.codec_id.as_str()) {
+        return Ok(tag);
     }
     Err(Error::unsupported(format!(
         "avi muxer: codec `{}` has no WAVEFORMATEX wFormatTag; \
@@ -279,6 +349,37 @@ fn build_video_strf(
     let height = params
         .height
         .ok_or_else(|| Error::invalid("avi muxer: video stream missing height"))?;
+    // `rawvideo`: the pixel format picks the DIB (`BI_RGB` /
+    // `BI_BITFIELDS` + masks) or raw-FourCC header; packets are packed
+    // top-down rows, so a DIB is written top-down (negative
+    // `biHeight`) and rows are padded to the DWORD stride when needed.
+    if params.codec_id.as_str() == "rawvideo" {
+        let fmt = params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("avi muxer: rawvideo stream missing pixel_format"))?;
+        let (compression, bit_count, masks, rule) =
+            crate::raw_dib::header_for(fmt).ok_or_else(|| {
+                Error::unsupported(format!(
+                    "avi muxer: rawvideo pixel format {fmt:?} has no AVI DIB / FourCC layout"
+                ))
+            })?;
+        let dib = rule == crate::raw_dib::RowRule::Dib;
+        let strf =
+            write_bitmap_info_header_oriented(width, height, compression, bit_count, &masks, dib);
+        let raw_layout = crate::raw_dib::RawLayout::new(fmt, rule, width, height, true)
+            .filter(|l| !l.is_identity());
+        let (scale, rate) = video_scale_rate(params);
+        return Ok(StrfEntry {
+            chunk_suffix: if dib { *b"db" } else { *b"dc" },
+            raw_layout,
+            handler_fourcc: compression,
+            strf,
+            strh_type: *b"vids",
+            sample_size: 0,
+            scale,
+            rate,
+        });
+    }
     let fourcc = video_fourcc(params)?;
     // Round-377: an indexed (palettised) BI_RGB DIB override. When the
     // caller registered the stream via `with_indexed_video`, emit a
@@ -292,6 +393,7 @@ fn build_video_strf(
         let (scale, rate) = video_scale_rate(params);
         return Ok(StrfEntry {
             chunk_suffix: *b"db",
+            raw_layout: None,
             handler_fourcc: [0, 0, 0, 0],
             strf,
             strh_type: *b"vids",
@@ -309,11 +411,19 @@ fn build_video_strf(
     // §"biHeight sign rules". Silently drop the flag for compressed
     // FourCCs rather than producing an out-of-spec file.
     let allow_top_down = fourcc == [0, 0, 0, 0];
-    let strf = if top_down && allow_top_down {
+    let mut strf = if top_down && allow_top_down {
         write_bitmap_info_header_oriented(width, height, fourcc, bit_count, &params.extradata, true)
     } else {
         write_bitmap_info_header(width, height, fourcc, bit_count, &params.extradata)
     };
+    // `biSizeImage` "may be 0 for uncompressed RGB" (VfW `wingdi.h`
+    // §BITMAPINFOHEADER) — so a compressed FourCC states it: the size of
+    // the decoded image, `biWidth × biHeight × biBitCount / 8`.
+    if !allow_top_down {
+        let size_image = u64::from(width) * u64::from(height) * u64::from(bit_count) / 8;
+        let size_image = u32::try_from(size_image).unwrap_or(u32::MAX);
+        strf[20..24].copy_from_slice(&size_image.to_le_bytes());
+    }
     let (scale, rate) = video_scale_rate(params);
     // BI_RGB streams use `db` chunks; everything else `dc`.
     let chunk_suffix = if fourcc == [0, 0, 0, 0] {
@@ -323,6 +433,7 @@ fn build_video_strf(
     };
     Ok(StrfEntry {
         chunk_suffix,
+        raw_layout: None,
         handler_fourcc: fourcc,
         strf,
         strh_type: *b"vids",
@@ -384,6 +495,7 @@ fn build_audio_strf(
         };
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -422,6 +534,7 @@ fn build_audio_strf(
         );
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -446,6 +559,7 @@ fn build_audio_strf(
         );
         return Ok(StrfEntry {
             chunk_suffix: *b"wb",
+            raw_layout: None,
             handler_fourcc: *b"\0\0\0\0",
             strf,
             strh_type: *b"auds",
@@ -470,6 +584,7 @@ fn build_audio_strf(
     );
     Ok(StrfEntry {
         chunk_suffix: *b"wb",
+        raw_layout: None,
         handler_fourcc: *b"\0\0\0\0",
         strf,
         strh_type: *b"auds",

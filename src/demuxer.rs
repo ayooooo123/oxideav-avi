@@ -62,10 +62,10 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::riff::{read_chunk_header, read_form_type, skip_chunk, skip_pad, AVI_FORM, LIST, RIFF};
+use crate::riff::{AVI_FORM, LIST, RIFF, read_chunk_header, read_form_type, skip_chunk, skip_pad};
 use crate::stream_format::{
-    parse_bitmap_info_header, parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
-    ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE,
+    ChannelLayout, ChannelMask, Guid, WAVE_FORMAT_EXTENSIBLE, parse_bitmap_info_header,
+    parse_waveformatex, parse_waveformatextensible, subformat_codec_hint,
 };
 
 /// Cheap deterministic hasher for `u64` file-offset map keys
@@ -1198,10 +1198,10 @@ fn open_avi_inner(
     // surfaced so absence remains observable via the typed
     // [`AviDemuxer::stream_name`] accessor.
     for (i, name_opt) in stream_names.iter().enumerate() {
-        if let Some(name) = name_opt {
-            if !name.is_empty() {
-                metadata.push((format!("avi:strn.{i}"), name.clone()));
-            }
+        if let Some(name) = name_opt
+            && !name.is_empty()
+        {
+            metadata.push((format!("avi:strn.{i}"), name.clone()));
         }
     }
 
@@ -1581,7 +1581,9 @@ fn open_avi_inner(
         .iter()
         .zip(&audio_infos)
         .map(|(t, a)| {
-            let mpeg = a.as_ref().is_some_and(|a| matches!(a.format_tag, WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3));
+            let mpeg = a
+                .as_ref()
+                .is_some_and(|a| matches!(a.format_tag, WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3));
             (mpeg && matches!(t, Tick::Bytes(_))).then(MpaSplitter::default)
         })
         .collect();
@@ -1724,13 +1726,13 @@ fn open_avi_inner(
         let mut per_stream_offsets: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut per_stream_2field: BTreeMap<u32, bool> = BTreeMap::new();
         for ix in &std_indexes {
-            if let Some(stream) = parse_stream_index(&ix.chunk_id) {
-                if ix.b_index_sub_type == AVI_INDEX_SUB_2FIELD {
-                    per_stream_2field.insert(stream, true);
-                    let v = per_stream_offsets.entry(stream).or_default();
-                    for e in &ix.entries {
-                        v.push(e.dw_offset_field2);
-                    }
+            if let Some(stream) = parse_stream_index(&ix.chunk_id)
+                && ix.b_index_sub_type == AVI_INDEX_SUB_2FIELD
+            {
+                per_stream_2field.insert(stream, true);
+                let v = per_stream_offsets.entry(stream).or_default();
+                for e in &ix.entries {
+                    v.push(e.dw_offset_field2);
                 }
             }
         }
@@ -1818,13 +1820,13 @@ fn open_avi_inner(
             // at [0..2] (`00dc` → stream 0). A divergence means the body
             // declares a different stream than the chunk header.
             let own_stream = parse_stream_index(&[ix.own_fourcc[2], ix.own_fourcc[3], 0, 0]);
-            if let Some(os) = own_stream {
-                if os != stream {
-                    metadata.push((
-                        format!("avi:ix.{os}.{segment_index}.chunk_id"),
-                        format_fourcc_or_hex(&ix.chunk_id),
-                    ));
-                }
+            if let Some(os) = own_stream
+                && os != stream
+            {
+                metadata.push((
+                    format!("avi:ix.{os}.{segment_index}.chunk_id"),
+                    format_fourcc_or_hex(&ix.chunk_id),
+                ));
             }
         }
     }
@@ -2003,10 +2005,10 @@ fn open_avi_inner(
             continue;
         }
         let ty = AviIndexType::from_raw(sx.b_index_type);
-        if ty != AviIndexType::OfIndexes {
-            if let Some(label) = ty.label() {
-                metadata.push((format!("avi:indx.{i}.index_type"), label.into()));
-            }
+        if ty != AviIndexType::OfIndexes
+            && let Some(label) = ty.label()
+        {
+            metadata.push((format!("avi:indx.{i}.index_type"), label.into()));
         }
     }
 
@@ -2191,10 +2193,10 @@ fn open_avi_inner(
                 // outside the primary `movi` segment's byte range.
                 // idx1 can't address that data, so the comparison
                 // is meaningless.
-                if let Some((p_start, p_end)) = primary_range {
-                    if ix.qw_base_offset < p_start || ix.qw_base_offset >= p_end {
-                        continue;
-                    }
+                if let Some((p_start, p_end)) = primary_range
+                    && (ix.qw_base_offset < p_start || ix.qw_base_offset >= p_end)
+                {
+                    continue;
                 }
                 for entry in &ix.entries {
                     let header_off = ix
@@ -2275,47 +2277,49 @@ fn open_avi_inner(
     //     video bitrate term — false positives outweigh signal),
     //   - the file has no idx1 (the video bitrate term is 0 and
     //     audio-only pacing is already exact in the populator).
-    if let Some(h) = &avih {
-        if h.max_bytes_per_sec > 0 && duration_micros > 0 && !idx_table.is_empty() {
-            // Audio: pull `avg_bytes_per_sec` per stream off
-            // `params.bit_rate` (which `build_stream` already set
-            // from the parsed WAVEFORMATEX's `nAvgBytesPerSec * 8`).
-            let audio_sum: u64 = streams
-                .iter()
-                .filter(|s| matches!(s.params.media_type, MediaType::Audio))
-                .filter_map(|s| s.params.bit_rate)
-                .map(|br| br / 8)
-                .sum();
-            // Video: sum of idx1 entry sizes for video streams,
-            // converted to bytes/sec via the file duration.
-            let mut video_bytes: u64 = 0;
-            for e in &idx_table {
-                let s = e.stream as usize;
-                if let Some(stream) = streams.get(s) {
-                    if matches!(stream.params.media_type, MediaType::Video) {
-                        video_bytes = video_bytes.saturating_add(e.size as u64);
-                    }
-                }
+    if let Some(h) = &avih
+        && h.max_bytes_per_sec > 0
+        && duration_micros > 0
+        && !idx_table.is_empty()
+    {
+        // Audio: pull `avg_bytes_per_sec` per stream off
+        // `params.bit_rate` (which `build_stream` already set
+        // from the parsed WAVEFORMATEX's `nAvgBytesPerSec * 8`).
+        let audio_sum: u64 = streams
+            .iter()
+            .filter(|s| matches!(s.params.media_type, MediaType::Audio))
+            .filter_map(|s| s.params.bit_rate)
+            .map(|br| br / 8)
+            .sum();
+        // Video: sum of idx1 entry sizes for video streams,
+        // converted to bytes/sec via the file duration.
+        let mut video_bytes: u64 = 0;
+        for e in &idx_table {
+            let s = e.stream as usize;
+            if let Some(stream) = streams.get(s)
+                && matches!(stream.params.media_type, MediaType::Video)
+            {
+                video_bytes = video_bytes.saturating_add(e.size as u64);
             }
-            // bytes_per_sec = video_bytes * 1_000_000 / micros.
-            let video_bps = if duration_micros > 0 {
-                let big = (video_bytes as u128) * 1_000_000u128;
-                let bps = big / (duration_micros as u128);
-                bps.min(u32::MAX as u128) as u64
-            } else {
-                0
-            };
-            let expected = audio_sum.saturating_add(video_bps);
-            if expected > h.max_bytes_per_sec as u64 {
-                metadata.push((
-                    "avi:over_budget".into(),
-                    format!(
-                        "expected_max={} stamped={}",
-                        expected.min(u32::MAX as u64),
-                        h.max_bytes_per_sec
-                    ),
-                ));
-            }
+        }
+        // bytes_per_sec = video_bytes * 1_000_000 / micros.
+        let video_bps = if duration_micros > 0 {
+            let big = (video_bytes as u128) * 1_000_000u128;
+            let bps = big / (duration_micros as u128);
+            bps.min(u32::MAX as u128) as u64
+        } else {
+            0
+        };
+        let expected = audio_sum.saturating_add(video_bps);
+        if expected > h.max_bytes_per_sec as u64 {
+            metadata.push((
+                "avi:over_budget".into(),
+                format!(
+                    "expected_max={} stamped={}",
+                    expected.min(u32::MAX as u64),
+                    h.max_bytes_per_sec
+                ),
+            ));
         }
     }
 
@@ -2378,22 +2382,26 @@ fn open_avi_inner(
     // by a forward scan over every segment), and fall back to `idx1`
     // (also file-ordered) only for streams with no `ix##`. Empty for a
     // stream with neither — the accessor then returns `None`.
+    //
+    // Zero-length chunks are left out (they never become packets, see
+    // `next_packet`), and an all-key stream (`MJPG`) reads key throughout.
+    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
     let mut ix_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
     for ix in &std_indexes {
         if let Some(s) = parse_stream_index(&ix.chunk_id) {
             let s = s as usize;
             if s < ix_per_stream.len() {
-                for e in &ix.entries {
-                    ix_per_stream[s].push(e.is_keyframe);
+                for e in ix.entries.iter().filter(|e| e.dw_size != 0) {
+                    ix_per_stream[s].push(e.is_keyframe || all_key[s]);
                 }
             }
         }
     }
     let mut idx1_kf_per_stream: Vec<Vec<bool>> = vec![Vec::new(); streams.len()];
-    for e in &idx_table {
+    for e in idx_table.iter().filter(|e| e.size != 0) {
         let s = e.stream as usize;
         if s < idx1_kf_per_stream.len() {
-            idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0);
+            idx1_kf_per_stream[s].push((e.flags & AVIIF_KEYFRAME) != 0 || all_key[s]);
         }
     }
     let keyframe_per_stream: Vec<Vec<bool>> = (0..streams.len())
@@ -2432,10 +2440,41 @@ fn open_avi_inner(
             DvType1 { video: video as u32, audio: streams.len() as u32 - 1 }
         });
 
+    // Compressed video: the decoded layout (and, for H.264 / H.265, the
+    // cropped output size) the codec's parameter sets state — after
+    // the BITMAPINFOHEADER, or in-band in the stream's first frame.
+    fill_layouts_from_parameter_sets(&mut *input, &mut streams, &movi_segments);
+
+    // `rawvideo` streams: how each on-wire frame maps onto the packed
+    // top-down packet layout the `rawvideo` decoder takes.
+    let raw_layouts: Vec<Option<crate::raw_dib::RawLayout>> = streams
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            let p = &st.params;
+            if p.codec_id.as_str() != "rawvideo" {
+                return None;
+            }
+            let rule = match p.tag {
+                Some(CodecTag::Fourcc(f)) if f == [0; 4] || f == [3, 0, 0, 0] => {
+                    crate::raw_dib::RowRule::Dib
+                }
+                _ => crate::raw_dib::RowRule::PackedTopDown,
+            };
+            let top_down = video_strfs
+                .get(i)
+                .and_then(|v| v.as_ref())
+                .is_some_and(|v| v.top_down);
+            crate::raw_dib::RawLayout::new(p.pixel_format?, rule, p.width?, p.height?, top_down)
+                .filter(|l| !l.is_identity())
+        })
+        .collect();
+
     // Seek to start of first movi body for next_packet.
     input.seek(SeekFrom::Start(movi_start))?;
 
     Ok(AviDemuxer {
+        raw_layouts,
         input,
         streams,
         packet_chunk_suffix,
@@ -4012,6 +4051,7 @@ pub(crate) struct AudioStrhInfo {
 /// shape doesn't carry channel mask / SubFormat GUID); only the
 /// `wFormatTag` field is always populated.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct AudioStrfInfo {
     /// On-wire `wFormatTag` value. Always set; equal to
     /// [`crate::stream_format::WAVE_FORMAT_EXTENSIBLE`] (`0xFFFE`)
@@ -4058,6 +4098,50 @@ pub struct AudioStrfInfo {
     pub bits_per_sample: u16,
 }
 
+impl AudioStrfInfo {
+    /// Set [`AudioStrfInfo::format_tag`].
+    #[must_use]
+    pub fn with_format_tag(mut self, v: u16) -> Self {
+        self.format_tag = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::valid_bits_per_sample`].
+    #[must_use]
+    pub fn with_valid_bits_per_sample(mut self, v: Option<u16>) -> Self {
+        self.valid_bits_per_sample = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::channel_mask`].
+    #[must_use]
+    pub fn with_channel_mask(mut self, v: Option<u32>) -> Self {
+        self.channel_mask = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::subformat`].
+    #[must_use]
+    pub fn with_subformat(mut self, v: Option<Guid>) -> Self {
+        self.subformat = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::avg_bytes_per_sec`].
+    #[must_use]
+    pub fn with_avg_bytes_per_sec(mut self, v: u32) -> Self {
+        self.avg_bytes_per_sec = v;
+        self
+    }
+
+    /// Set [`AudioStrfInfo::bits_per_sample`].
+    #[must_use]
+    pub fn with_bits_per_sample(mut self, v: u16) -> Self {
+        self.bits_per_sample = v;
+        self
+    }
+}
+
 /// One CBR-audio `ix##` standard-index entry whose `dwSize` is not a
 /// whole multiple of the stream's `WAVEFORMATEX.nBlockAlign`
 /// (round-96).
@@ -4078,6 +4162,7 @@ pub struct AudioStrfInfo {
 /// gross VBR/CBR mismatch; this is a finer, index-level check callers
 /// opt into).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BlockAlignViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4092,6 +4177,18 @@ pub struct BlockAlignViolation {
     /// The stream's `WAVEFORMATEX.nBlockAlign` the size was checked
     /// against.
     pub block_align: u16,
+}
+
+impl BlockAlignViolation {
+    /// Build a [`BlockAlignViolation`] from all of its fields.
+    pub fn new(stream_index: u32, entry_index: usize, dw_size: u32, block_align: u16) -> Self {
+        Self {
+            stream_index,
+            entry_index,
+            dw_size,
+            block_align,
+        }
+    }
 }
 
 /// One video stream whose `AVISF_VIDEO_PALCHANGES` strh flag disagrees
@@ -4119,6 +4216,7 @@ pub struct BlockAlignViolation {
 /// Scoped to video streams, since the flag + chunk family are
 /// video-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PaletteChangeFlagViolation {
     /// Stream number whose `AVISF_VIDEO_PALCHANGES` flag was checked.
     pub stream_index: u32,
@@ -4131,6 +4229,17 @@ pub struct PaletteChangeFlagViolation {
     /// when this is `> 0` but `flag_set` is `false`, or when this is
     /// `0` but `flag_set` is `true`.
     pub palette_change_chunks: u32,
+}
+
+impl PaletteChangeFlagViolation {
+    /// Build a [`PaletteChangeFlagViolation`] from all of its fields.
+    pub fn new(stream_index: u32, flag_set: bool, palette_change_chunks: u32) -> Self {
+        Self {
+            stream_index,
+            flag_set,
+            palette_change_chunks,
+        }
+    }
 }
 
 /// One super-index whose per-segment `dwDuration` total disagrees with
@@ -4158,6 +4267,7 @@ pub struct PaletteChangeFlagViolation {
 /// and a `dmlh` extended header (the only configuration where the two
 /// counts are independently recorded and therefore comparable).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexDurationViolation {
     /// Stream number whose `indx` super-index was checked.
     pub stream_index: u32,
@@ -4166,6 +4276,17 @@ pub struct SuperIndexDurationViolation {
     pub super_index_duration_total: u64,
     /// The file's `dmlh.dwTotalFrames` the total was compared against.
     pub dmlh_total_frames: u64,
+}
+
+impl SuperIndexDurationViolation {
+    /// Build a [`SuperIndexDurationViolation`] from all of its fields.
+    pub fn new(stream_index: u32, super_index_duration_total: u64, dmlh_total_frames: u64) -> Self {
+        Self {
+            stream_index,
+            super_index_duration_total,
+            dmlh_total_frames,
+        }
+    }
 }
 
 /// One `ix##` standard-index whose `qwBaseOffset` does not anchor
@@ -4192,6 +4313,7 @@ pub struct SuperIndexDurationViolation {
 /// the per-segment `dwChunkId` / `dwDuration` surfaces with a
 /// position-level sanity check between the index and the `movi` body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdIndexBaseOffsetViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4204,6 +4326,17 @@ pub struct StdIndexBaseOffsetViolation {
     /// The chunk's verbatim `qwBaseOffset` that landed outside every
     /// `movi` LIST region.
     pub qw_base_offset: u64,
+}
+
+impl StdIndexBaseOffsetViolation {
+    /// Build a [`StdIndexBaseOffsetViolation`] from all of its fields.
+    pub fn new(stream_index: u32, segment_index: usize, qw_base_offset: u64) -> Self {
+        Self {
+            stream_index,
+            segment_index,
+            qw_base_offset,
+        }
+    }
 }
 
 /// One truncated `ix##` standard-index chunk surfaced by
@@ -4221,6 +4354,7 @@ pub struct StdIndexBaseOffsetViolation {
 /// the loss. Informational only — never fails `open()`, and the OpenDML
 /// seek path uses just the entries it actually parsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StdIndexEntryCountViolation {
     /// Stream number (from the two ASCII digits of the `ix##` chunk's
     /// `dwChunkId`, e.g. `01wb` ⇒ stream 1).
@@ -4238,6 +4372,23 @@ pub struct StdIndexEntryCountViolation {
     pub parsed_entries: u32,
 }
 
+impl StdIndexEntryCountViolation {
+    /// Build a [`StdIndexEntryCountViolation`] from all of its fields.
+    pub fn new(
+        stream_index: u32,
+        segment_index: usize,
+        declared_entries: u32,
+        parsed_entries: u32,
+    ) -> Self {
+        Self {
+            stream_index,
+            segment_index,
+            declared_entries,
+            parsed_entries,
+        }
+    }
+}
+
 /// One `(qwOffset, dwSize, dwDuration)` triple from a stream's `indx`
 /// super-index, surfaced verbatim by
 /// [`AviDemuxer::super_index_entries`] (round 394).
@@ -4251,6 +4402,7 @@ pub struct StdIndexEntryCountViolation {
 /// `dwDuration` the *"time span in stream ticks"* of the chunks that
 /// standard index covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexEntryInfo {
     /// File-absolute offset of the pointed-to `ix##` chunk header.
     pub qw_offset: u64,
@@ -4258,6 +4410,17 @@ pub struct SuperIndexEntryInfo {
     pub dw_size: u32,
     /// Stream-tick span of the chunks indexed by that `ix##`.
     pub dw_duration: u32,
+}
+
+impl SuperIndexEntryInfo {
+    /// Build a [`SuperIndexEntryInfo`] from all of its fields.
+    pub fn new(qw_offset: u64, dw_size: u32, dw_duration: u32) -> Self {
+        Self {
+            qw_offset,
+            dw_size,
+            dw_duration,
+        }
+    }
 }
 
 /// One `indx` super-index entry whose `qwOffset` does not land on any
@@ -4284,6 +4447,7 @@ pub struct SuperIndexEntryInfo {
 /// without breaking playback. Same family as
 /// [`StdIndexBaseOffsetViolation`] / [`StdIndexEntryCountViolation`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SuperIndexTargetViolation {
     /// Stream whose `indx` super-index carries the stale entry.
     pub stream_index: u32,
@@ -4293,6 +4457,17 @@ pub struct SuperIndexTargetViolation {
     /// The entry's verbatim `qwOffset` that matched no `ix##` chunk
     /// header position.
     pub qw_offset: u64,
+}
+
+impl SuperIndexTargetViolation {
+    /// Build a [`SuperIndexTargetViolation`] from all of its fields.
+    pub fn new(stream_index: u32, entry_index: usize, qw_offset: u64) -> Self {
+        Self {
+            stream_index,
+            entry_index,
+            qw_offset,
+        }
+    }
 }
 
 /// Round-394 helper shared by [`AviDemuxer::super_index_target_violations`]
@@ -4750,10 +4925,29 @@ fn build_stream(
             if let Some(b) = &bmih {
                 ctx = ctx.width(b.width).height(b.height);
             }
-            let codec_id = codecs
-                .resolve_tag(&ctx)
-                .unwrap_or_else(|| video_codec_id_fallback(&compression));
+            // Uncompressed DIB / raw-FourCC layouts are fully defined
+            // by the header (VfW `BITMAPINFOHEADER` §biCompression /
+            // §biBitCount): surface them as the fleet's `rawvideo`
+            // codec + an explicit pixel format, ahead of any tag claim.
+            let raw = bmih.as_ref().and_then(|b| {
+                let masks = if b.compression == crate::stream_format::BI_BITFIELDS {
+                    crate::stream_format::parse_bitfields_masks(&b.extradata)
+                } else {
+                    None
+                };
+                crate::raw_dib::pixel_format_for(b.compression, b.bit_count, masks)
+            });
+            let codec_id = if raw.is_some() {
+                CodecId::new("rawvideo")
+            } else {
+                codecs
+                    .resolve_tag(&ctx)
+                    .unwrap_or_else(|| video_codec_id_fallback(&compression))
+            };
             let mut p = CodecParameters::video(codec_id.clone());
+            if let Some((fmt, _)) = raw {
+                p.pixel_format = Some(fmt);
+            }
             // Stamp the on-wire FourCC straight onto the params so a
             // muxer re-emitting this stream round-trips byte-for-byte
             // (no walking the registry's first-declared tag).
@@ -4799,9 +4993,9 @@ fn build_stream(
                 });
             }
             // Frame rate from scale/rate (rate/scale = fps).
-            p.frame_rate = Some(Rational::new(rate as i64, scale as i64));
+            p.frame_rate = frame_rate_from_strh(rate_raw, scale_raw);
             // MJPEG packets from AVI should be flagged as standalone JPEGs.
-            let suffix = if codec_id.as_str() == "rgb24" {
+            let suffix = if matches!(codec_id.as_str(), "rgb24" | "rawvideo") {
                 *b"db"
             } else {
                 *b"dc"
@@ -5047,6 +5241,119 @@ fn build_stream(
 /// uses for unknown-FourCC palette / text / data side-band keys
 /// (see the `key` branch in [`scan_idx1_for_sideband_summary`] and
 /// the `avi_namespaced` branches around line 4935).
+/// `strh` `dwRate / dwScale` as a reduced frame rate (VfW: "Dividing
+/// dwRate by dwScale gives the number of samples per second"); `None`
+/// when either is zero.
+fn frame_rate_from_strh(rate: u32, scale: u32) -> Option<Rational> {
+    if rate == 0 || scale == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (rate, scale);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Some(Rational::new(i64::from(rate / a), i64::from(scale / a)))
+}
+
+/// How far into `movi` [`fill_layouts_from_parameter_sets`] reads
+/// before giving up on a stream's first frame.
+const FIRST_FRAME_PEEK_BYTES: u64 = 4 << 20;
+
+/// Fill `pixel_format` (and correct `width` / `height` to the cropped
+/// output size) for every H.264 / H.265 / VP9 / AV1 video stream from
+/// what its parameter sets state (see [`crate::video_config`]): the
+/// configuration bytes after the `BITMAPINFOHEADER` first, then the
+/// stream's first non-empty chunk in `movi`, found by a plain chunk
+/// walk (`LIST 'rec '` entered) over at most
+/// [`FIRST_FRAME_PEEK_BYTES`]. The caller repositions the reader.
+fn fill_layouts_from_parameter_sets<R: ReadSeek + ?Sized>(
+    input: &mut R,
+    streams: &mut [StreamInfo],
+    movi_segments: &[(u64, u64)],
+) {
+    use crate::video_config::{Family, Layout, layout_of};
+    let mut pending: Vec<(usize, Family, Layout)> = Vec::new();
+    for (i, st) in streams.iter_mut().enumerate() {
+        let p = &mut st.params;
+        if p.media_type != MediaType::Video || p.pixel_format.is_some() {
+            continue;
+        }
+        let fourcc = match p.tag {
+            Some(CodecTag::Fourcc(f)) => f,
+            _ => [0; 4],
+        };
+        let Some(family) = Family::of(p.codec_id.as_str(), fourcc) else {
+            continue;
+        };
+        let layout = layout_of(family, &p.extradata);
+        if layout.is_complete(family) {
+            apply_layout(p, layout);
+        } else {
+            pending.push((i, family, layout));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let Some(&(start, end)) = movi_segments.first() else {
+        return;
+    };
+    let limit = end.min(start.saturating_add(FIRST_FRAME_PEEK_BYTES));
+    let mut pos = start;
+    while !pending.is_empty() && pos.saturating_add(8) <= limit {
+        let mut hdr = [0u8; 12];
+        if input.seek(SeekFrom::Start(pos)).is_err() || input.read_exact(&mut hdr[..8]).is_err() {
+            break;
+        }
+        let id = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let size = u64::from(u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]));
+        if &id == b"LIST" {
+            if input.read_exact(&mut hdr[8..]).is_err() {
+                break;
+            }
+            if &hdr[8..12] == b"rec " {
+                pos += 12;
+                continue;
+            }
+        } else if size > 0
+            && let (Some(a), Some(b)) = ((id[0] as char).to_digit(10), (id[1] as char).to_digit(10))
+            && let Some(k) = pending.iter().position(|e| e.0 == (a * 10 + b) as usize)
+        {
+            let mut head = vec![0u8; size.min(64 << 10) as usize];
+            if input.read_exact(&mut head).is_err() {
+                break;
+            }
+            let (idx, family, from_header) = pending.swap_remove(k);
+            let from_frame = layout_of(family, &head);
+            apply_layout(
+                &mut streams[idx].params,
+                Layout {
+                    pixel_format: from_header.pixel_format.or(from_frame.pixel_format),
+                    size: from_header.size.or(from_frame.size),
+                },
+            );
+        }
+        // RIFF chunks are WORD-aligned.
+        pos = pos
+            .saturating_add(8)
+            .saturating_add(size)
+            .saturating_add(size & 1);
+    }
+    for (idx, _, layout) in pending {
+        apply_layout(&mut streams[idx].params, layout);
+    }
+}
+
+fn apply_layout(p: &mut CodecParameters, layout: crate::video_config::Layout) {
+    if p.pixel_format.is_none() {
+        p.pixel_format = layout.pixel_format;
+    }
+    if let Some((w, h)) = layout.size {
+        p.width = Some(w);
+        p.height = Some(h);
+    }
+}
+
 fn format_fourcc_or_hex(fourcc: &[u8; 4]) -> String {
     let printable = fourcc.iter().all(|&b| (0x20..=0x7e).contains(&b));
     if printable {
@@ -5183,7 +5490,6 @@ fn probe_file_len<R: ReadSeek + ?Sized>(r: &mut R) -> Result<u64> {
     r.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
-
 
 /// Parse a raw `idx1` body, decide whether the recorded offsets are
 /// file-absolute or `movi`-relative (both are seen in the wild), and
@@ -5546,6 +5852,7 @@ fn probe_offset_has_ckid<R: ReadSeek + ?Sized>(
 /// One entry per video stream (parallel to [`AviDemuxer::streams`]
 /// for `media_type == Video`); audio / data streams have `None`.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct VideoStrfInfo {
     /// `true` when the on-wire `biHeight` was negative ⇒ top-down
     /// DIB (origin upper-left) per VfW §"biHeight sign rules". Only
@@ -5610,6 +5917,71 @@ pub struct VideoStrfInfo {
     /// forensic / repair caller can observe a non-conformant writer that
     /// stamped a value other than 1, via [`AviDemuxer::stream_planes`].
     pub planes: u16,
+}
+
+impl VideoStrfInfo {
+    /// Set [`VideoStrfInfo::top_down`].
+    #[must_use]
+    pub fn with_top_down(mut self, v: bool) -> Self {
+        self.top_down = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::bitfields_masks`].
+    #[must_use]
+    pub fn with_bitfields_masks(mut self, v: Option<(u32, u32, u32)>) -> Self {
+        self.bitfields_masks = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::palette`].
+    #[must_use]
+    pub fn with_palette(mut self, v: Option<Vec<crate::stream_format::RgbQuad>>) -> Self {
+        self.palette = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::size_image`].
+    #[must_use]
+    pub fn with_size_image(mut self, v: u32) -> Self {
+        self.size_image = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::x_pels_per_meter`].
+    #[must_use]
+    pub fn with_x_pels_per_meter(mut self, v: i32) -> Self {
+        self.x_pels_per_meter = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::y_pels_per_meter`].
+    #[must_use]
+    pub fn with_y_pels_per_meter(mut self, v: i32) -> Self {
+        self.y_pels_per_meter = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::clr_used`].
+    #[must_use]
+    pub fn with_clr_used(mut self, v: u32) -> Self {
+        self.clr_used = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::clr_important`].
+    #[must_use]
+    pub fn with_clr_important(mut self, v: u32) -> Self {
+        self.clr_important = v;
+        self
+    }
+
+    /// Set [`VideoStrfInfo::planes`].
+    #[must_use]
+    pub fn with_planes(mut self, v: u16) -> Self {
+        self.planes = v;
+        self
+    }
 }
 
 /// The `strh.fccHandler` values FFmpeg's avidec accepts on a type-1 DV
@@ -5968,6 +6340,10 @@ pub struct AviDemuxer {
     /// by stream number; `None` for non-video streams or video streams
     /// whose `strf` payload was empty / shorter than 40 bytes.
     video_strf: Vec<Option<VideoStrfInfo>>,
+    /// Per-stream on-wire → `rawvideo` packet row conversion; `Some`
+    /// only for `rawvideo` streams whose frames are bottom-up or
+    /// stride-padded (others pass through untouched).
+    raw_layouts: Vec<Option<crate::raw_dib::RawLayout>>,
     /// Per-audio-stream WAVEFORMATEX(TENSIBLE)-derived side-info
     /// (channel mask, valid bits per sample, SubFormat GUID) — round-75
     /// per Microsoft `mmreg.h` §"WAVEFORMATEXTENSIBLE" and
@@ -6404,6 +6780,7 @@ struct SeekCache {
 /// caller must decode-and-discard `gop_distance` ticks worth of
 /// frames before reaching the wanted PTS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyframeSeekResult {
     /// The PTS the caller asked for.
     pub target_pts: i64,
@@ -6415,6 +6792,17 @@ pub struct KeyframeSeekResult {
     /// stream ticks worth of frames a caller must walk past after the
     /// seek to reach the originally-requested PTS.
     pub gop_distance: i64,
+}
+
+impl KeyframeSeekResult {
+    /// Build a [`KeyframeSeekResult`] from all of its fields.
+    pub fn new(target_pts: i64, landed_pts: i64, gop_distance: i64) -> Self {
+        Self {
+            target_pts,
+            landed_pts,
+            gop_distance,
+        }
+    }
 }
 
 /// `AVIF_HASINDEX` per Microsoft's `vfw.h` — the file has an `idx1`.
@@ -7001,11 +7389,11 @@ impl PaletteChange {
         let num_entries = body[1];
         let flags = u16::from_le_bytes([body[2], body[3]]);
         let tail = &body[4..];
-        if tail.len() % 4 != 0 {
+        if !tail.len().is_multiple_of(4) {
             return None;
         }
         let mut entries = Vec::with_capacity(tail.len() / 4);
-        for chunk in tail.chunks_exact(4) {
+        for chunk in tail.as_chunks::<4>().0 {
             entries.push(PaletteEntry {
                 red: chunk[0],
                 green: chunk[1],
@@ -7806,7 +8194,7 @@ impl Demuxer for AviDemuxer {
             // cluster chunks this way. Recurse by entering the list body.
             if hdr.id == LIST {
                 let _form = read_form_type(&mut *self.input)?; // likely "rec "
-                                                               // Continue: next iteration will consume its nested chunks.
+                // Continue: next iteration will consume its nested chunks.
                 continue;
             }
             // End of movi guard in case sizes disagree. A chunk cut by
@@ -7908,10 +8296,20 @@ impl Demuxer for AviDemuxer {
                         || suffix == *b"db"
                         || suffix == *b"wb";
                     if accept && hdr.size == 0 && self.dv_type1.is_none() {
-                        // avidec.c:1371-1380: an empty chunk (a dropped
-                        // frame) yields no packet; the stream's clock still
-                        // advances by its duration (`get_duration`). Type-1
-                        // DV files keep theirs, as FFmpeg's dv_demux path does.
+                        // AVI 1.0 §AVISTREAMHEADER: with `dwSampleSize` 0
+                        // "each sample of data (such as a video frame) must
+                        // be in a separate chunk", and only an
+                        // `AVIIF_NO_TIME` chunk "does not affect timing"
+                        // (AVI 1.0 §AVIOLDINDEX). A zero-length data chunk
+                        // holds no frame — the dropped / repeated-frame
+                        // placeholder capture and transcoding writers leave
+                        // — so it is not surfaced as a packet (there is
+                        // nothing to decode) while the stream clock still
+                        // counts it: the next real packet keeps its
+                        // timestamp, and the gap in `pts` says the previous
+                        // picture stays on screen. avidec.c:1371-1380 skips
+                        // it the same way; type-1 DV files keep theirs, as
+                        // FFmpeg's dv_demux path does.
                         let tick = self.ticks[idx as usize];
                         self.per_stream_counter[idx as usize] += tick.advance(0);
                         continue;
@@ -7928,14 +8326,20 @@ impl Demuxer for AviDemuxer {
                         if !corrupt {
                             skip_pad(&mut *self.input, hdr.size)?;
                         }
+                        let data = match self.raw_layouts.get(idx as usize) {
+                            Some(Some(l)) => l.unpack(data),
+                            _ => data,
+                        };
                         let counter = self.per_stream_counter[idx as usize];
                         let tick = self.ticks[idx as usize];
-                        if let Some(split) = self.mpa.get_mut(idx as usize).and_then(Option::as_mut) {
+                        if let Some(split) = self.mpa.get_mut(idx as usize).and_then(Option::as_mut)
+                        {
                             // FFmpeg's MPEG audio parser: the chunk's bytes
                             // (from its byte position) join the stream; whole
                             // frames come out from the loop's top.
                             split.push(counter.saturating_mul(u64::from(tick.bytes())), &data);
-                            self.per_stream_counter[idx as usize] = counter + tick.advance(data.len());
+                            self.per_stream_counter[idx as usize] =
+                                counter + tick.advance(data.len());
                             self.mpa_ready = Some(idx as usize);
                             continue;
                         }
@@ -7957,13 +8361,19 @@ impl Demuxer for AviDemuxer {
                         // describe randomly is all-intra / uncompressed
                         // data). For compressed delta-frame streams the
                         // index is present and the flag is exact.
+                        // OpenDML AVI File Format Extensions §7.0: "In an
+                        // AVI sequence all JPEG frames will be key frames"
+                        // — an `MJPG` chunk is one even when an index
+                        // entry left the flag clear.
                         pkt.flags.keyframe = self
                             .keyframe_by_offset
                             .get(&chunk_header_off)
                             .copied()
-                            .unwrap_or(true);
+                            .unwrap_or(true)
+                            || is_all_key_stream(stream);
                         // Bump counter.
-                        self.per_stream_counter[idx as usize] = counter + tick.advance(pkt.data.len());
+                        self.per_stream_counter[idx as usize] =
+                            counter + tick.advance(pkt.data.len());
                         if let Some(dv) = self.dv_type1.filter(|dv| dv.video == idx) {
                             let mut audio = Packet::new(dv.audio, pkt.time_base, pkt.data.clone());
                             let pts = if self.dv_audio_timed { None } else { pkt.pts };
@@ -8007,6 +8417,14 @@ impl Demuxer for AviDemuxer {
         // still seek by walking the std-index entries for the matching
         // stream. The std-indexes index every chunk across every RIFF
         // segment, so they're the canonical OpenDML-only seek path.
+        //
+        // The same path wins in a multi-segment file even when `idx1` is
+        // present: `idx1` covers the primary `RIFF AVI ` only, so its
+        // keyframe table would miss every key frame in a `RIFF AVIX`
+        // continuation and land the seek too early.
+        if !self.std_indexes.is_empty() && self.movi_segments.len() > 1 {
+            return self.seek_via_std_indexes(stream_index, pts);
+        }
         if self.idx_table.is_empty() {
             if !self.std_indexes.is_empty() {
                 return self.seek_via_std_indexes(stream_index, pts);
@@ -8167,15 +8585,15 @@ impl AviDemuxer {
             ))
         };
         for (k, v) in &self.metadata {
-            if let Some(canon) = canonical {
-                if k == canon {
-                    return Some(v.as_str());
-                }
+            if let Some(canon) = canonical
+                && k == canon
+            {
+                return Some(v.as_str());
             }
-            if let Some(ns) = avi_namespaced.as_deref() {
-                if k == ns {
-                    return Some(v.as_str());
-                }
+            if let Some(ns) = avi_namespaced.as_deref()
+                && k == ns
+            {
+                return Some(v.as_str());
             }
         }
         None
@@ -11604,7 +12022,7 @@ impl AviDemuxer {
     /// running pts is ≤ `target_pts`. Each entry's pts is synthesised
     /// the same way `build_idx_table` does it for `idx1`: walk the
     /// per-stream entries in file order, advancing per-stream pts by
-    /// `packet_time_delta(stream, size)` per chunk.
+    /// the stream's chunk tick divisor per chunk.
     ///
     /// Per-stream PTS counters are reset to the landed entry's value so
     /// `next_packet` resumes synthesising correct PTS post-seek.
@@ -11689,7 +12107,12 @@ impl AviDemuxer {
     /// per demuxer.
     fn ensure_seek_cache(&mut self) {
         if self.seek_cache.is_none() {
-            self.seek_cache = Some(build_seek_cache(&self.idx_table, &self.std_indexes, &self.ticks));
+            self.seek_cache = Some(build_seek_cache(
+                &self.idx_table,
+                &self.std_indexes,
+                &self.streams,
+                &self.ticks,
+            ));
         }
     }
 }
@@ -11701,9 +12124,11 @@ impl AviDemuxer {
 fn build_seek_cache(
     idx_table: &[IdxEntry],
     std_indexes: &[StdIndex],
+    streams: &[StreamInfo],
     ticks: &[Tick],
 ) -> SeekCache {
-    let n = ticks.len();
+    let n = streams.len();
+    let all_key: Vec<bool> = streams.iter().map(is_all_key_stream).collect();
     let mut idx1_keyframes: Vec<Vec<(i64, u64)>> = vec![Vec::new(); n];
     let mut idx1_kf_monotonic = vec![true; n];
     let mut idx1_entries: Vec<Vec<(u64, i64)>> = vec![Vec::new(); n];
@@ -11719,13 +12144,14 @@ fn build_seek_cache(
             continue;
         }
         idx1_entries[s].push((e.offset, e.pts));
-        if (e.flags & AVIIF_KEYFRAME) == 0 {
+        // A zero-length chunk is never a packet, so never a landing point.
+        if e.size == 0 || ((e.flags & AVIIF_KEYFRAME) == 0 && !all_key[s]) {
             continue;
         }
-        if let Some(&(prev_pts, _)) = idx1_keyframes[s].last() {
-            if e.pts < prev_pts {
-                idx1_kf_monotonic[s] = false;
-            }
+        if let Some(&(prev_pts, _)) = idx1_keyframes[s].last()
+            && e.pts < prev_pts
+        {
+            idx1_kf_monotonic[s] = false;
         }
         idx1_keyframes[s].push((e.pts, e.offset));
     }
@@ -11755,17 +12181,17 @@ fn build_seek_cache(
             // (just past the 8-byte header). Our `next_packet`
             // expects to land on the chunk header, so back off 8.
             let header_off = abs_off.saturating_sub(8);
-            if let Some(&(prev_off, _)) = std_entries[s].last() {
-                if header_off < prev_off {
-                    std_off_monotonic[s] = false;
-                }
+            if let Some(&(prev_off, _)) = std_entries[s].last()
+                && header_off < prev_off
+            {
+                std_off_monotonic[s] = false;
             }
             std_entries[s].push((header_off, running_unsigned[s]));
-            if e.is_keyframe {
-                if let Some(&(prev_pts, _)) = std_keyframes[s].last() {
-                    if running_signed[s] < prev_pts {
-                        std_kf_monotonic[s] = false;
-                    }
+            if e.dw_size != 0 && (e.is_keyframe || all_key[s]) {
+                if let Some(&(prev_pts, _)) = std_keyframes[s].last()
+                    && running_signed[s] < prev_pts
+                {
+                    std_kf_monotonic[s] = false;
                 }
                 std_keyframes[s].push((running_signed[s], header_off));
             }
@@ -11841,6 +12267,13 @@ fn ascii_hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Whether every frame of the stream is a key frame whatever its index
+/// says: `MJPG` — OpenDML AVI File Format Extensions §7.0, "In an AVI
+/// sequence all JPEG frames will be key frames".
+fn is_all_key_stream(stream: &StreamInfo) -> bool {
+    stream.params.tag == Some(CodecTag::Fourcc(*b"MJPG"))
+}
+
 /// How a stream's packets advance its timestamp, as FFmpeg's avidec
 /// (`get_duration`, with `avi_read_header`'s sample-size rules).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11850,8 +12283,8 @@ pub(crate) enum Tick {
     /// One per `n` bytes: the stream's sample size (audio stored by the
     /// byte, PCM by the sample frame).
     Bytes(u32),
-    /// One per started `n`-byte block: audio with no sample size, by its
-    /// nBlockAlign.
+    /// One per started `n`-byte block: PCM-family audio with no sample
+    /// size, by its nBlockAlign.
     Blocks(u32),
 }
 
@@ -11878,8 +12311,15 @@ impl Tick {
 /// WAVEFORMATEX: avidec.c sets an audio stream's sample size to its
 /// nBlockAlign when both are set and differ, drops it for MP3 frames of
 /// 1152 and AAC frames of 1024 or 4096 declared as both, and ignores an
-/// nBlockAlign of 4 or less for AAC, MP2 and FLAC.
-fn stream_ticks(streams: &[StreamInfo], sample_sizes: &[Option<u32>], audio: &[Option<AudioStrhInfo>]) -> Vec<Tick> {
+/// nBlockAlign of 4 or less for AAC, MP2 and FLAC. A stream that states
+/// no sample size takes one tick per chunk, as avidec counts it; only a
+/// PCM-family stream, whose `nBlockAlign` is its wire frame, counts
+/// blocks instead.
+fn stream_ticks(
+    streams: &[StreamInfo],
+    sample_sizes: &[Option<u32>],
+    audio: &[Option<AudioStrhInfo>],
+) -> Vec<Tick> {
     streams
         .iter()
         .enumerate()
@@ -11899,12 +12339,20 @@ fn stream_ticks(streams: &[StreamInfo], sample_sizes: &[Option<u32>], audio: &[O
             if (aac || tag == WAVE_FORMAT_MPEG || tag == 0xF1AC) && align <= 4 {
                 align = 0;
             }
-            if (aac && (align, size) == (1024, 1024)) || (aac && (align, size) == (4096, 4096)) || (tag == WAVE_FORMAT_MPEGLAYER3 && (align, size) == (1152, 1152)) {
+            if aac && ((align, size) == (1024, 1024) || (align, size) == (4096, 4096))
+                || (tag == WAVE_FORMAT_MPEGLAYER3 && (align, size) == (1152, 1152))
+            {
                 size = 0;
             }
             if size > 0 {
                 Tick::Bytes(size)
-            } else if align > 0 {
+            } else if align > 0 && s.params.sample_format.is_some() {
+                // PCM-family only: `nBlockAlign` is the wire frame size
+                // there, and a writer that left `dwSampleSize` at 0 still
+                // packs whole sample blocks. Compressed audio declares its
+                // own frames and avidec counts one per chunk whatever
+                // `nBlockAlign` says (FFmpeg's own MP3-in-AVI writes 1152
+                // there and still steps one tick per packet).
                 Tick::Blocks(align)
             } else {
                 Tick::Packet
@@ -11919,12 +12367,20 @@ fn stream_ticks(streams: &[StreamInfo], sample_sizes: &[Option<u32>], audio: &[O
 fn mpa_frame_len(h: [u8; 4]) -> Option<usize> {
     const BITRATE: [[[u16; 15]; 3]; 2] = [
         [
-            [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
-            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
-            [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+            [
+                0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448,
+            ],
+            [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384,
+            ],
+            [
+                0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ],
         ],
         [
-            [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+            [
+                0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256,
+            ],
             [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
             [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
         ],
@@ -11934,7 +12390,13 @@ fn mpa_frame_len(h: [u8; 4]) -> Option<usize> {
     let layer = (w >> 17) & 3; // 3 I, 2 II, 1 III
     let bitrate = ((w >> 12) & 15) as usize;
     let rate = ((w >> 10) & 3) as usize;
-    if w & 0xFFE0_0000 != 0xFFE0_0000 || version == 1 || layer == 0 || bitrate == 0 || bitrate == 15 || rate == 3 {
+    if w & 0xFFE0_0000 != 0xFFE0_0000
+        || version == 1
+        || layer == 0
+        || bitrate == 0
+        || bitrate == 15
+        || rate == 3
+    {
         return None;
     }
     let lsf = usize::from(version != 3);
@@ -12006,7 +12468,8 @@ impl MpaSplitter {
                     // padding, CRC and channel mode may change.
                     const FORMAT_MASK: u32 = 0x001e_0c00;
                     if mpa_frame_len(next).is_none()
-                        || (u32::from_be_bytes(header) ^ u32::from_be_bytes(next)) & FORMAT_MASK != 0
+                        || (u32::from_be_bytes(header) ^ u32::from_be_bytes(next)) & FORMAT_MASK
+                            != 0
                     {
                         start += 1;
                         continue;
@@ -12099,10 +12562,10 @@ mod tests {
         body.extend_from_slice(b"00dc"); // dwChunkId
         body.extend_from_slice(&0x1000u64.to_le_bytes()); // qwBaseOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
-                                                     // Entry 0: keyframe.
+        // Entry 0: keyframe.
         body.extend_from_slice(&0x100u32.to_le_bytes()); // dwOffset
         body.extend_from_slice(&512u32.to_le_bytes()); // dwSize (high bit clear → kf)
-                                                       // Entry 1: delta frame.
+        // Entry 1: delta frame.
         body.extend_from_slice(&0x300u32.to_le_bytes());
         body.extend_from_slice(&((512u32) | 0x8000_0000).to_le_bytes());
 
@@ -12134,7 +12597,7 @@ mod tests {
         body.extend_from_slice(b"00dc");
         body.extend_from_slice(&0x2000u64.to_le_bytes()); // qwBaseOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // dwReserved3
-                                                     // Entry 0: 2-field interlaced video; field-2 offset follows.
+        // Entry 0: 2-field interlaced video; field-2 offset follows.
         body.extend_from_slice(&0x40u32.to_le_bytes()); // dwOffset (field 1)
         body.extend_from_slice(&1024u32.to_le_bytes()); // dwSize (whole frame)
         body.extend_from_slice(&0x80u32.to_le_bytes()); // dwOffsetField2
@@ -12252,7 +12715,7 @@ mod tests {
         body.extend_from_slice(&720u32.to_le_bytes()); // dwFrameWidthInPixels
         body.extend_from_slice(&576u32.to_le_bytes()); // dwFrameHeightInLines
         body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2
-                                                     // Field 0 (top).
+        // Field 0 (top).
         body.extend_from_slice(&288u32.to_le_bytes()); // CompressedBMHeight
         body.extend_from_slice(&720u32.to_le_bytes()); // CompressedBMWidth
         body.extend_from_slice(&288u32.to_le_bytes()); // ValidBMHeight
@@ -12261,7 +12724,7 @@ mod tests {
         body.extend_from_slice(&0u32.to_le_bytes()); // ValidBMYOffset
         body.extend_from_slice(&0u32.to_le_bytes()); // VideoXOffsetInT
         body.extend_from_slice(&23u32.to_le_bytes()); // VideoYValidStartLine (top)
-                                                      // Field 1 (bottom).
+        // Field 1 (bottom).
         body.extend_from_slice(&288u32.to_le_bytes());
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&288u32.to_le_bytes());
@@ -12295,7 +12758,7 @@ mod tests {
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&576u32.to_le_bytes());
         body.extend_from_slice(&2u32.to_le_bytes()); // nbFieldPerFrame = 2 …
-                                                     // … but only one rect follows.
+        // … but only one rect follows.
         body.extend_from_slice(&288u32.to_le_bytes());
         body.extend_from_slice(&720u32.to_le_bytes());
         body.extend_from_slice(&288u32.to_le_bytes());
